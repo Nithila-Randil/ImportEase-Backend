@@ -48,8 +48,10 @@ class AgencyRegisterRequest(BaseModel):
 
 
 class AgencyProfileRequest(BaseModel):
-    businessRegNumber: str
     licenseNumber: str
+    businessAddress: str
+    businessPhone: str
+    businessRegNumber: Optional[str] = None  # only required for real (non-independent) agencies
 
 
 class AgentApprovalRequest(BaseModel):
@@ -104,15 +106,21 @@ def register(data: RegisterRequest):
         raise HTTPException(status_code=400, detail="Invalid role")
 
     agency_id = None
+    is_agency_admin = False
 
-    # If registering as a clearing agent, validate the agency code up front
     if data.role == "clearing_agent":
-        if not data.agencyCode:
-            raise HTTPException(status_code=400, detail="agencyCode is required for clearing agents")
-
-        agency_id, agency_data = find_agency_by_code(data.agencyCode)
-        if not agency_id:
-            raise HTTPException(status_code=400, detail="Invalid agency code")
+        if data.agencyCode:
+            # Joining an existing agency — becomes a pending agent
+            agency_id, agency_data = find_agency_by_code(data.agencyCode)
+            if not agency_id:
+                raise HTTPException(status_code=400, detail="Invalid agency code")
+            is_agency_admin = False
+        else:
+            # No agency code given — treat as an independent agent.
+            # Auto-create a one-person "agency" so the rest of the system
+            # (profileStatus, bidding eligibility gate) works identically.
+            agency_id = None  # created after the user record below
+            is_agency_admin = True
 
     # 1. Create the user in Firebase Authentication
     user_record = auth.create_user(
@@ -120,6 +128,29 @@ def register(data: RegisterRequest):
         password=data.password,
         display_name=data.name
     )
+
+    # 1b. If this is an independent clearing agent, create their solo agency now
+    if data.role == "clearing_agent" and is_agency_admin:
+        agency_code = generate_agency_code()
+        while find_agency_by_code(agency_code)[0] is not None:
+            agency_code = generate_agency_code()
+
+        agency_data = {
+            "companyName": data.name,  # solo agent's own name as the "company"
+            "email": data.email,
+            "agencyCode": agency_code,
+            "adminUid": user_record.uid,
+            "profileStatus": "incomplete",
+            "businessRegNumber": None,
+            "licenseNumber": None,
+            "businessAddress": None,
+            "businessPhone": None,
+            "isIndependent": True,  # flags this as a solo agent, not a real multi-person agency
+            "createdAt": datetime.now(timezone.utc).isoformat()
+        }
+        agency_ref = db.collection("agencies").document()
+        agency_ref.set(agency_data)
+        agency_id = agency_ref.id
 
     # 2. Build the Firestore profile
     user_data = {
@@ -133,8 +164,10 @@ def register(data: RegisterRequest):
 
     if data.role == "clearing_agent":
         user_data["agencyId"] = agency_id
-        user_data["isAgencyAdmin"] = False
-        user_data["agentStatus"] = "pending"
+        user_data["isAgencyAdmin"] = is_agency_admin
+        # Independent agents are auto-approved (they're their own admin);
+        # agents joining an existing agency wait for that agency's admin
+        user_data["agentStatus"] = "approved" if is_agency_admin else "pending"
         user_data["profileComplete"] = False
         user_data["phone"] = None
 
@@ -254,6 +287,9 @@ def register_agency(data: AgencyRegisterRequest):
         "profileStatus": "incomplete",
         "businessRegNumber": None,
         "licenseNumber": None,
+        "businessAddress": None,
+        "businessPhone": None,
+        "isIndependent": False,
         "createdAt": datetime.now(timezone.utc).isoformat()
     }
     agency_ref = db.collection("agencies").document()
@@ -315,11 +351,23 @@ def complete_agency_profile(id: str, data: AgencyProfileRequest, user: dict = De
     if agency_data.get("adminUid") != user["uid"]:
         raise HTTPException(status_code=403, detail="Only the agency admin can complete this profile")
 
-    doc_ref.update({
-        "businessRegNumber": data.businessRegNumber,
+    is_independent = agency_data.get("isIndependent", False)
+
+    # businessRegNumber only applies to real, multi-agent agencies — not solo/independent agents
+    if not is_independent and not data.businessRegNumber:
+        raise HTTPException(status_code=400, detail="businessRegNumber is required for registered agencies")
+
+    update_fields = {
         "licenseNumber": data.licenseNumber,
+        "businessAddress": data.businessAddress,
+        "businessPhone": data.businessPhone,
         "profileStatus": "active"
-    })
+    }
+
+    if not is_independent:
+        update_fields["businessRegNumber"] = data.businessRegNumber
+
+    doc_ref.update(update_fields)
 
     updated_doc = doc_ref.get()
     return {
