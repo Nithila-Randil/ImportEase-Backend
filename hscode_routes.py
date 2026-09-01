@@ -44,7 +44,7 @@ def search_hscodes(q: str = Query(..., description="Plain-language product descr
 
         score = cosine_similarity(query_embedding, stored_embedding)
         scored_results.append((score, data))
-        print(f"{score:.3f} — {data.get('description')}")
+        print(f"{score:.3f} — {data.get('description')}" )
 
     scored_results.sort(key=lambda x: x[0], reverse=True)
 
