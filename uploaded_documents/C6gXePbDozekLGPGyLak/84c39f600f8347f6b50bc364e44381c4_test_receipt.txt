@@ -1,0 +1,5 @@
+This is a test receipt file for testing the ImportEase document upload endpoint.
+
+Shipment: C6gXePbDozekLGPGyLak
+Type: Customs clearance receipt
+Date: Test upload

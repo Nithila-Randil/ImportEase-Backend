@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 from firebase_setup import db
 from dependencies import verify_token
+from notification_routes import create_notification
 
 router = APIRouter()
 
@@ -197,4 +198,11 @@ def update_shipment_status(shipment_id: str, status_update: StatusUpdate, user: 
         )
 
     doc_ref.update({"currentStage": expected_next})
+
+    create_notification(
+        user_id=data.get("importerId"),
+        shipment_id=shipment_id,
+        message=f"Your shipment {data.get('reference', shipment_id)} has moved to '{expected_next}'.",
+    )
+
     return {"currentStage": expected_next}

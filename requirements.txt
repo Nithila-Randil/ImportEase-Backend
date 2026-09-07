@@ -1,9 +1,0 @@
-fastapi
-uvicorn
-firebase-admin
-python-dotenv
-google-genai
-pandas
-openpyxl
-numpy
-pydantic

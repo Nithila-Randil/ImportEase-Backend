@@ -166,38 +166,47 @@ def update_profile(id: str, data: ProfileUpdateRequest, user: dict = Depends(ver
     user_data = doc.to_dict()
     role = user_data.get("role")
 
+    if role == "clearing_agent" and user_data.get("agentStatus") == "rejected":
+        raise HTTPException(status_code=403, detail="Rejected agents cannot update their profile")
+
+    # Only touch fields the caller actually sent (exclude_unset), so an
+    # omitted field is left alone but an EXPLICIT null really clears a
+    # previously-set value -- fixes the "can't clear fields" bug.
+    update_data = data.dict(exclude_unset=True)
     update_fields = {}
 
-    if data.phone is not None:
-        update_fields["phone"] = data.phone
+    if "phone" in update_data:
+        update_fields["phone"] = update_data["phone"]
 
     if role == "clearing_agent":
-        if data.phone:
-            update_fields["profileComplete"] = True
+        final_phone = update_data.get("phone", user_data.get("phone"))
+        # Recomputed every time (not just set-and-forget), so clearing the
+        # phone later correctly flips this back to false.
+        update_fields["profileComplete"] = bool(final_phone)
 
     elif role == "importer":
-        if data.isRegisteredBusiness is not None:
-            update_fields["isRegisteredBusiness"] = data.isRegisteredBusiness
+        if "isRegisteredBusiness" in update_data:
+            update_fields["isRegisteredBusiness"] = update_data["isRegisteredBusiness"]
+            if update_data["isRegisteredBusiness"] is False:
+                # Switched off -- clear the now-irrelevant business fields
+                # instead of leaving stale values sitting in Firestore.
+                update_fields["businessName"] = None
+                update_fields["businessRegNumber"] = None
+                update_fields["businessAddress"] = None
+                update_fields["businessCategory"] = None
 
-        if data.isRegisteredBusiness:
-            if data.businessName is not None:
-                update_fields["businessName"] = data.businessName
-            if data.businessRegNumber is not None:
-                update_fields["businessRegNumber"] = data.businessRegNumber
-            if data.businessAddress is not None:
-                update_fields["businessAddress"] = data.businessAddress
-            if data.businessCategory is not None:
-                update_fields["businessCategory"] = data.businessCategory
+        is_registered_business = update_data.get("isRegisteredBusiness", user_data.get("isRegisteredBusiness"))
+        if is_registered_business:
+            for field in ["businessName", "businessRegNumber", "businessAddress", "businessCategory"]:
+                if field in update_data:
+                    update_fields[field] = update_data[field]
 
-        if data.products is not None:
-            update_fields["products"] = data.products
-        if data.countries is not None:
-            update_fields["countries"] = data.countries
-        if data.importFrequency is not None:
-            update_fields["importFrequency"] = data.importFrequency
+        for field in ["products", "countries", "importFrequency"]:
+            if field in update_data:
+                update_fields[field] = update_data[field]
 
-        if data.phone:
-            update_fields["profileComplete"] = True
+        final_phone = update_data.get("phone", user_data.get("phone"))
+        update_fields["profileComplete"] = bool(final_phone)
 
     doc_ref.update(update_fields)
 
@@ -206,3 +215,19 @@ def update_profile(id: str, data: ProfileUpdateRequest, user: dict = Depends(ver
         "id": id,
         **updated_doc.to_dict()
     }
+
+
+@router.delete("/users/{id}")
+def delete_user(id: str, user: dict = Depends(verify_token)):
+    """Self-service account deletion -- a user can only delete their own account."""
+    if user["uid"] != id:
+        raise HTTPException(status_code=403, detail="You can only delete your own account")
+
+    doc_ref = db.collection("users").document(id)
+    if not doc_ref.get().exists:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    doc_ref.delete()
+    auth.delete_user(id)
+
+    return {"detail": "Account deleted"}

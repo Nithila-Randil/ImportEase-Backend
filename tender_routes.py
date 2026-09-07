@@ -27,6 +27,7 @@ from pydantic import BaseModel
 
 from firebase_setup import db
 from dependencies import verify_token
+from notification_routes import create_notification
 
 router = APIRouter()
 
@@ -280,5 +281,11 @@ def accept_bid(tender_id: str, bid_id: str, user: dict = Depends(verify_token)):
         "agentId": bid_data.get("agentId"),
         "currentStage": "assigned",
     })
+
+    create_notification(
+        user_id=bid_data.get("agentId"),
+        shipment_id=tender_data["shipmentId"],
+        message=f"Your bid was accepted! You're now assigned to shipment {tender_data['shipmentId']}.",
+    )
 
     return {"id": bid_id, **bid_ref.get().to_dict()}

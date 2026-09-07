@@ -72,6 +72,32 @@ def get_hscode_detail(code: str):
     }
 
 
+def _rate_value(data: dict, field_name: str) -> float:
+    """Reads a rate field that may be stored two different ways:
+    - Real imported customs data: {"raw": "18%", "type": "percentage", "value": 0.18}
+    - Old sample seed data (seed_hscodes.py): a plain number, e.g. 0.18
+    Returns the usable decimal rate either way. type "none" (or missing)
+    naturally resolves to a value of 0.
+    """
+    field = data.get(field_name, 0)
+    if isinstance(field, dict):
+        return field.get("value", 0) or 0
+    return field or 0
+
+
+def _flat_value(data: dict, flat_field_name: str):
+    """Looks for a separate flat-amount field (e.g. "cid_flat"). Still a best
+    guess -- no real HS code has been seen yet where a duty actually uses the
+    'X% OR flat amount, whichever is higher' rule, so this may need
+    revisiting once a real example turns up (the real data might encode this
+    as a 'type' value like "compound" inside the same rate object instead of
+    a separate top-level field)."""
+    field = data.get(flat_field_name)
+    if isinstance(field, dict):
+        return field.get("value")
+    return field
+
+
 @router.get("/hscodes/{code}/landed-cost")
 def get_landed_cost(code: str, value: float = Query(..., description="Declared CIF shipment value"), origin: Optional[str] = None):
     doc = db.collection("hscodes").document(code).get()
@@ -80,31 +106,54 @@ def get_landed_cost(code: str, value: float = Query(..., description="Declared C
 
     data = doc.to_dict()
 
-    cid_rate = data.get("cid_rate", 0)
-    vat_rate = data.get("vat_rate", 0)
-    pal_rate = data.get("pal_rate", 0)
-    cess_rate = data.get("cess_rate", 0)
-    scl_rate = data.get("scl_rate", 0)
-    sscl_rate = data.get("sscl_rate", 0)
-    port_fee_rate = data.get("port_fee_rate", 0.005)  # default 0.5% of CIF
+    cid_rate = _rate_value(data, "cid_rate")
+    vat_rate = _rate_value(data, "vat_rate")
+    pal_rate = _rate_value(data, "pal_rate")
+    cess_rate = _rate_value(data, "cess_rate")
+    scl_rate = _rate_value(data, "scl_rate")
+    sscl_rate = _rate_value(data, "sscl_rate")
+    excise_rate = _rate_value(data, "excise_rate")
+
+    port_fee_field = data.get("port_fee_rate", 0.005)
+    port_fee_rate = port_fee_field.get("value", 0.005) if isinstance(port_fee_field, dict) else (port_fee_field or 0.005)
 
     cif = value
 
-    cid = cif * cid_rate
-    pal = cif * pal_rate
-    cess = cif * cess_rate
+    def rate_or_flat(rate, flat_field):
+        """Applies an 'X% OR flat amount, whichever is higher' rule when a
+        flat amount is defined for this HS code; otherwise falls back to a
+        plain percentage."""
+        percentage_amount = cif * rate
+        flat_amount = _flat_value(data, flat_field)
+        if flat_amount:
+            return max(percentage_amount, flat_amount)
+        return percentage_amount
+
+    scl_applies = scl_rate > 0
     scl = cif * scl_rate
 
-    # VAT is calculated on CIF + CID + PAL + CESS, per Sri Lanka customs practice
-    vat_base = cif + cid + pal + cess
-    vat = vat_base * vat_rate
+    if scl_applies:
+        # SCL REPLACES the CID/VAT/PAL/CESS duty stack rather than adding to
+        # it, per Sri Lanka Customs practice for SCL-covered goods.
+        cid = 0
+        pal = 0
+        cess = 0
+        vat = 0
+    else:
+        cid = rate_or_flat(cid_rate, "cid_flat")
+        pal = rate_or_flat(pal_rate, "pal_flat")
+        cess = rate_or_flat(cess_rate, "cess_flat")
+        # VAT is calculated on CIF + CID + PAL + CESS, per Sri Lanka customs practice
+        vat_base = cif + cid + pal + cess
+        vat = vat_base * vat_rate
 
-    # SSCL calculated on CIF for simplicity
+    # SSCL, Excise, and port fees sit outside the duty stack, so they still
+    # apply either way, regardless of whether SCL kicked in.
     sscl = cif * sscl_rate
-
+    excise = cif * excise_rate
     port_fees = cif * port_fee_rate
 
-    total_landed_cost = cif + cid + vat + pal + cess + scl + sscl + port_fees
+    total_landed_cost = cif + cid + vat + pal + cess + scl + sscl + excise + port_fees
 
     return {
         "code": code,
@@ -115,8 +164,10 @@ def get_landed_cost(code: str, value: float = Query(..., description="Declared C
         "cess": round(cess, 2),
         "scl": round(scl, 2),
         "sscl": round(sscl, 2),
+        "excise": round(excise, 2),
         "portFees": round(port_fees, 2),
-        "totalLandedCost": round(total_landed_cost, 2)
+        "totalLandedCost": round(total_landed_cost, 2),
+        "sclReplacedDutyStack": scl_applies
     }
 
 
