@@ -31,6 +31,8 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 
 PDF_FOLDER = "tariff_pdfs"
 DAILY_CALL_LIMIT = 900
+MAX_TOTAL_CODES = 900
+
 
 # Column positions within each page's extracted table.
 # Confirmed against real output: HS Hdg, HS Code, hierarchy marker,
@@ -226,9 +228,13 @@ if __name__ == "__main__":
 
     all_codes = []
     for pdf_path in pdf_files:
+        if len(all_codes) >= MAX_TOTAL_CODES:
+            break
         codes = extract_codes_from_pdf(pdf_path)
+        remaining = MAX_TOTAL_CODES - len(all_codes)
+        codes = codes[:remaining]
         print(f"  {os.path.basename(pdf_path)}: {len(codes)} codes extracted")
         all_codes.extend(codes)
 
-    print(f"\nTotal codes extracted: {len(all_codes)}")
+    print(f"\nTotal codes extracted: {len(all_codes)} (limit: {MAX_TOTAL_CODES})")
     seed_with_resumability(all_codes)
