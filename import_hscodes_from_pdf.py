@@ -1,0 +1,240 @@
+"""
+Bulk import script — reads real Sri Lanka Customs HS code data directly
+from individual chapter PDF files (not the merged Excel, which had a
+column-drift bug), extracts genuine product-level codes, generates
+Gemini embeddings, and writes everything to Firestore.
+
+RESUMABLE: since Gemini's free tier caps at 1,000 requests/day, this
+script checks Firestore first and SKIPS any code that already has an
+embedding — safe to re-run across multiple days.
+
+Setup: put all your chapter PDF files into a folder named "tariff_pdfs"
+in the same directory as this script.
+
+Run with: python import_hscodes_from_pdf.py
+"""
+
+import re
+import time
+import glob
+import pdfplumber
+
+from dotenv import load_dotenv
+import os
+from google import genai
+
+from firebase_setup import db
+
+load_dotenv()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+PDF_FOLDER = "tariff_pdfs"
+DAILY_CALL_LIMIT = 900
+MAX_TOTAL_CODES = 900
+
+
+# Column positions within each page's extracted table.
+# Confirmed against real output: HS Hdg, HS Code, hierarchy marker,
+# Description, Unit, ICL/SLSI, AP, AD, BN, GT, IN, PK, SA, SF, SD, SG,
+# Gen Duty, VAT, PAL-Gen, PAL-SG, Cess, Excise, SSCL, SCL
+COL_HEADING = 0
+COL_CODE = 1
+COL_DESCRIPTION = 3
+COL_UNIT = 4
+COL_GEN_DUTY = 16
+COL_VAT = 17
+COL_CESS = 20
+COL_EXCISE = 21
+COL_SSCL = 22
+COL_SCL = 23
+
+def get_chapter_title_from_pdf(pdf_path):
+    """Extracts the real chapter title directly from the PDF's first page,
+    e.g. 'Chapter 27' followed by 'Mineral fuels, mineral oils...' —
+    matches the actual government document instead of a hand-typed guess."""
+    with pdfplumber.open(pdf_path) as pdf:
+        first_page_text = pdf.pages[0].extract_text()
+
+    match = re.search(r"Chapter\s+(\d+)\s*\n(.+)", first_page_text)
+    if match:
+        chapter_number = int(match.group(1))
+        title = match.group(2).strip()
+        return chapter_number, title
+
+    return None, "Uncategorized"
+
+
+def parse_rate(value):
+    """Same logic as before, but now also detects 'X% or Rs.Y per unit'
+    patterns and returns a structured dict for those, instead of
+    silently dropping the whole code. Every result includes 'raw' —
+    the exact original text from the PDF — so the parsed values can
+    always be verified against the real source, not just trusted blindly."""
+    if value is None or value.strip() == "":
+        return {"type": "none", "value": 0.0, "raw": None}
+
+    raw_original = value.strip()
+    text = re.sub(r"\s+", " ", raw_original).lower()
+
+    if text in ("free", "ex", "ex.", "nil", "-", "con", "conditional"):
+        return {"type": "none", "value": 0.0, "raw": raw_original}
+
+    or_match = re.search(
+        r"(\d+(?:\.\d+)?)\s*%\s*or\s*rs\.?\s*(\d+(?:\.\d+)?)", text
+    )
+    if or_match:
+        percentage = float(or_match.group(1)) / 100
+        flat_amount = float(or_match.group(2))
+        return {
+            "type": "whichever_higher",
+            "percentage": percentage,
+            "flatAmount": flat_amount,
+            "raw": raw_original
+        }
+
+    percent_match = re.match(r"^(\d+(?:\.\d+)?)\s*%$", text)
+    if percent_match:
+        return {
+            "type": "percentage",
+            "value": float(percent_match.group(1)) / 100,
+            "raw": raw_original
+        }
+
+    flat_match = re.search(r"rs\.?\s*(\d+(?:\.\d+)?)", text)
+    if flat_match:
+        return {
+            "type": "flat",
+            "flatAmount": float(flat_match.group(1)),
+            "raw": raw_original
+        }
+
+    return {"type": "unknown", "raw": raw_original}
+
+
+def extract_codes_from_pdf(pdf_path):
+    """Extracts all valid product-level HS codes from one PDF file,
+    page by page, re-detecting each page's table structure fresh."""
+    extracted = []
+    chapter_number, category = get_chapter_title_from_pdf(pdf_path)
+
+    current_heading = None
+    current_heading_description = None
+
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            tables = page.extract_tables()
+            if not tables:
+                continue
+
+            for row in tables[0]:
+                if len(row) <= max(COL_CODE, COL_DESCRIPTION):
+                    continue
+
+                heading_raw = row[COL_HEADING] if len(row) > COL_HEADING else None
+                code_raw = row[COL_CODE]
+                description = row[COL_DESCRIPTION]
+
+                # A heading row (e.g. "27.11") has a heading value but no code —
+                # update the current heading context for codes that follow
+                if heading_raw and heading_raw.strip() and not (code_raw and code_raw.strip()):
+                    current_heading = heading_raw.strip()
+                    current_heading_description = str(description).replace("\n", " ").strip() if description else None
+                    continue
+
+                if not code_raw or not description:
+                    continue
+
+                code_str = str(code_raw).strip()
+                if not re.match(r"^\d{2,4}\.\d{2}", code_str):
+                    continue  # skip section headings, blank rows
+
+                description_clean = str(description).replace("\n", " ").strip()
+
+                extracted.append({
+                    "code": code_str,
+                    "description": description_clean,
+                    "heading": current_heading,
+                    "headingDescription": current_heading_description,
+                    "category": category,
+                    "unit": str(row[COL_UNIT]).strip() if row[COL_UNIT] else None,
+                    "cid_rate": parse_rate(row[COL_GEN_DUTY]),
+                    "vat_rate": parse_rate(row[COL_VAT]),
+                    "cess_rate": parse_rate(row[COL_CESS]),
+                    "excise_rate": parse_rate(row[COL_EXCISE]),
+                    "sscl_rate": parse_rate(row[COL_SSCL]),
+                    "scl_rate": parse_rate(row[COL_SCL]),
+                    "compliance": [],
+                    "sourceFile": os.path.basename(pdf_path)
+                })
+
+    return extracted
+
+
+def seed_with_resumability(codes):
+    calls_made_this_run = 0
+    newly_seeded = 0
+    already_done = 0
+
+    for item in codes:
+        if calls_made_this_run >= DAILY_CALL_LIMIT:
+            print(f"\nReached the daily call limit ({DAILY_CALL_LIMIT}). Stopping here.")
+            print("Run this script again tomorrow to continue.")
+            break
+
+        doc_ref = db.collection("hscodes").document(item["code"])
+        existing = doc_ref.get()
+
+        if existing.exists and existing.to_dict().get("embedding"):
+            already_done += 1
+            continue
+
+        # Embed richer context — heading + category + description — not
+        # just the bare description, so search understands broader context
+        embed_text_parts = [item["description"]]
+        if item.get("headingDescription"):
+            embed_text_parts.append(item["headingDescription"])
+        if item.get("category"):
+            embed_text_parts.append(item["category"])
+        embed_text = " | ".join(embed_text_parts)
+
+        try:
+            result = client.models.embed_content(
+                model="gemini-embedding-001",
+                contents=embed_text
+            )
+            item["embedding"] = result.embeddings[0].values
+        except Exception as e:
+            print(f"Failed to embed {item['code']}: {e}")
+            continue
+
+        doc_ref.set(item)  # write immediately — safe if interrupted
+        calls_made_this_run += 1
+        newly_seeded += 1
+
+        if calls_made_this_run % 50 == 0:
+            print(f"Progress: {calls_made_this_run} embedded this run...")
+
+        time.sleep(0.1)
+
+    print(f"\nDone for today.")
+    print(f"Newly seeded: {newly_seeded}")
+    print(f"Already had embeddings (skipped): {already_done}")
+
+
+if __name__ == "__main__":
+    pdf_files = glob.glob(os.path.join(PDF_FOLDER, "*.pdf"))
+    print(f"Found {len(pdf_files)} PDF files in '{PDF_FOLDER}'.")
+
+    all_codes = []
+    for pdf_path in pdf_files:
+        if len(all_codes) >= MAX_TOTAL_CODES:
+            break
+        codes = extract_codes_from_pdf(pdf_path)
+        remaining = MAX_TOTAL_CODES - len(all_codes)
+        codes = codes[:remaining]
+        print(f"  {os.path.basename(pdf_path)}: {len(codes)} codes extracted")
+        all_codes.extend(codes)
+
+    print(f"\nTotal codes extracted: {len(all_codes)} (limit: {MAX_TOTAL_CODES})")
+    seed_with_resumability(all_codes)

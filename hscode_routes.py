@@ -6,6 +6,7 @@ import os
 from google import genai
 
 from firebase_setup import db
+from duty_calculator import calculate_landed_cost
 
 router = APIRouter()
 
@@ -30,6 +31,7 @@ def search_hscodes(q: str = Query(..., description="Plain-language product descr
     HS code's stored embedding using cosine similarity, so it can match
     everyday words (e.g. "TV") to formal descriptions (e.g. "television
     receivers") even when the exact words don't overlap."""
+    
     all_codes = db.collection("hscodes").get()
 
     result = client.models.embed_content(model="gemini-embedding-001", contents=q)
@@ -49,7 +51,7 @@ def search_hscodes(q: str = Query(..., description="Plain-language product descr
     scored_results.sort(key=lambda x: x[0], reverse=True)
 
     top_matches = [
-        {"code": data.get("code"), "description": data.get("description")}
+        {"code": data.get("code"), "description": data.get("description"),"headingDescription":data.get("headingDescription")}
         for score, data in scored_results[:10]
         if score > 0.3
     ]
@@ -79,45 +81,9 @@ def get_landed_cost(code: str, value: float = Query(..., description="Declared C
         raise HTTPException(status_code=404, detail="HS code not found")
 
     data = doc.to_dict()
+    breakdown = calculate_landed_cost(data, value)
 
-    cid_rate = data.get("cid_rate", 0)
-    vat_rate = data.get("vat_rate", 0)
-    pal_rate = data.get("pal_rate", 0)
-    cess_rate = data.get("cess_rate", 0)
-    scl_rate = data.get("scl_rate", 0)
-    sscl_rate = data.get("sscl_rate", 0)
-    port_fee_rate = data.get("port_fee_rate", 0.005)  # default 0.5% of CIF
-
-    cif = value
-
-    cid = cif * cid_rate
-    pal = cif * pal_rate
-    cess = cif * cess_rate
-    scl = cif * scl_rate
-
-    # VAT is calculated on CIF + CID + PAL + CESS, per Sri Lanka customs practice
-    vat_base = cif + cid + pal + cess
-    vat = vat_base * vat_rate
-
-    # SSCL calculated on CIF for simplicity
-    sscl = cif * sscl_rate
-
-    port_fees = cif * port_fee_rate
-
-    total_landed_cost = cif + cid + vat + pal + cess + scl + sscl + port_fees
-
-    return {
-        "code": code,
-        "declaredValue": round(cif, 2),
-        "cid": round(cid, 2),
-        "vat": round(vat, 2),
-        "pal": round(pal, 2),
-        "cess": round(cess, 2),
-        "scl": round(scl, 2),
-        "sscl": round(sscl, 2),
-        "portFees": round(port_fees, 2),
-        "totalLandedCost": round(total_landed_cost, 2)
-    }
+    return {"code": code, **breakdown}
 
 
 @router.get("/hscodes/{code}/compliance")
