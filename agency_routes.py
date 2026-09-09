@@ -121,6 +121,15 @@ def complete_agency_profile(id: str, data: AgencyProfileRequest, user: dict = De
     if not is_independent and not data.businessRegNumber:
         raise HTTPException(status_code=400, detail="businessRegNumber is required for registered agencies")
 
+    # Guard against blank strings silently marking the profile "active" --
+    # every required field must have real content, not just be present.
+    required_fields = [data.licenseNumber, data.businessAddress, data.businessPhone]
+    if not is_independent:
+        required_fields.append(data.businessRegNumber)
+
+    if any(not (f and f.strip()) for f in required_fields):
+        raise HTTPException(status_code=400, detail="Required fields cannot be blank")
+
     update_fields = {
         "licenseNumber": data.licenseNumber,
         "businessAddress": data.businessAddress,
@@ -185,3 +194,28 @@ def approve_agent(id: str, agentId: str, data: AgentApprovalRequest, user: dict 
         "id": agentId,
         **updated_doc.to_dict()
     }
+
+
+@router.delete("/agencies/{id}/agents/{agentId}")
+def remove_agent(id: str, agentId: str, user: dict = Depends(verify_token)):
+    """Agency admin removes an existing agent from their agency (deletes their account)."""
+    agency_doc = db.collection("agencies").document(id).get()
+    if not agency_doc.exists:
+        raise HTTPException(status_code=404, detail="Agency not found")
+
+    if agency_doc.to_dict().get("adminUid") != user["uid"]:
+        raise HTTPException(status_code=403, detail="Only the agency admin can remove an agent")
+
+    if agentId == user["uid"]:
+        raise HTTPException(status_code=400, detail="Admins cannot remove themselves this way")
+
+    agent_ref = db.collection("users").document(agentId)
+    agent_doc = agent_ref.get()
+
+    if not agent_doc.exists or agent_doc.to_dict().get("agencyId") != id:
+        raise HTTPException(status_code=404, detail="Agent not found in this agency")
+
+    agent_ref.delete()
+    auth.delete_user(agentId)
+
+    return {"detail": "Agent removed from agency"}
