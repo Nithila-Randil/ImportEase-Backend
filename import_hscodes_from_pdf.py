@@ -1,10 +1,11 @@
 """
 Bulk import script — reads real Sri Lanka Customs HS code data directly
 from individual chapter PDF files, extracts genuine product-level codes,
-stores structured data in Firestore (NO embeddings), and uses Pinecone's
-built-in inference API to generate embeddings and upsert vectors.
+stores structured data in Firestore (NO embeddings), and upserts one text
+record per code to a Pinecone index whose integrated model
+(llama-text-embed-v2) embeds it server-side.
 
-No Gemini API calls needed — Pinecone handles all embedding internally.
+No Gemini / OpenAI calls needed — Pinecone handles all embedding internally.
 
 RESUMABLE: checks Pinecone first and SKIPS any code that already has a
 vector — safe to re-run.
@@ -13,364 +14,637 @@ Setup:
   1. Put all chapter PDF files into a folder named "tariff_pdfs".
   2. Set PINECONE_API_KEY and PINECONE_INDEX_NAME in your .env file.
 
-Run with: python import_hscodes_from_pdf.py
+Run with:
+  python import_hscodes_from_pdf.py            # full import (Firestore + Pinecone)
+  python import_hscodes_from_pdf.py --dry-run  # parse only, print stats, no writes
+
+
+How the extraction works
+────────────────────────
+The chapter PDFs are born-digital and every tariff table is drawn with real
+ruling lines, so pdfplumber's "lines" table strategy reconstructs the grid
+(including empty cells) reliably.  The column *meaning* still varies chapter to
+chapter — some chapters have an Excise column, some a "Surcharge on Customs
+Duty" column, Chapter 87 additionally has Luxury Tax — so we read each table's
+own two-row header ("HS Code / Description / … / Gen Duty / VAT / PAL / Cess /
+…" on top, "AP AD BN … / Gen SG" underneath) and build a column map from the
+labels rather than assuming fixed indices.
+
+Every national duty that appears in the source is captured: CID (Gen Duty),
+VAT, PAL, Cess, Excise, Surcharge on Customs Duty, SSCL, SCL and — for
+Chapter 87 — Luxury Tax, plus the ten preferential-duty (trade-agreement)
+columns.  Six-digit parent headings that only exist to group their eight/
+ten-digit children are dropped so they are not stored as fake products.
 """
 
 import re
+import sys
 import time
 import glob
-import pdfplumber
-
-from dotenv import load_dotenv
 import os
-from pinecone import Pinecone, ServerlessSpec
+
+import pdfplumber
+from dotenv import load_dotenv
 
 from firebase_setup import db
 
 load_dotenv()
 
 PINECONE_API_KEY    = os.getenv("PINECONE_API_KEY")
-PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "importease-hscodes")
+PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "hscode-embeddings")
 
-# ── Pinecone setup ────────────────────────────────────────────────────────────
-pc = Pinecone(api_key=PINECONE_API_KEY)
-
-# Pinecone's "multilingual-e5-large" model produces 1024-dim vectors
-EMBED_MODEL       = "multilingual-e5-large"
-EMBEDDING_DIM     = 1024
-
-if PINECONE_INDEX_NAME not in [idx.name for idx in pc.list_indexes()]:
-    print(f"Creating Pinecone index '{PINECONE_INDEX_NAME}' ...")
-    pc.create_index(
-        name=PINECONE_INDEX_NAME,
-        dimension=EMBEDDING_DIM,
-        metric="cosine",
-        spec=ServerlessSpec(cloud="aws", region="us-east-1"),
-    )
-    while not pc.describe_index(PINECONE_INDEX_NAME).status["ready"]:
-        time.sleep(1)
-    print("Index ready.")
-
-pinecone_index = pc.Index(PINECONE_INDEX_NAME)
-
-# ─────────────────────────────────────────────────────────────────────────────
+# The index carries integrated embedding — we upsert plain text and Pinecone
+# embeds it server-side with this model. Used only when creating the index.
+PINECONE_MODEL     = "llama-text-embed-v2"   # 1024-dim, 2048-token input
+PINECONE_NAMESPACE = "__default__"
 
 PDF_FOLDER      = "tariff_pdfs"
-MAX_TOTAL_CODES = 50
-UPSERT_BATCH    = 50   # upsert to Pinecone in batches
+MAX_TOTAL_CODES = 480   # how many codes to process; None = all of them
+UPSERT_BATCH    = 96     # Pinecone embeds at most 96 records per upsert_records call
 
-# ── Dynamic Column Detection per PDF ──────────────────────────────────────────
-def detect_columns_from_pdf(pdf):
-    """
-    Scans pages in the PDF to find the table header row containing 'HS Code'
-    and maps the exact column positions for this specific file dynamically.
-    """
-    # Fallback defaults in case a header row is not found
-    cols = {
-        "heading": 0,
-        "code": 1,
-        "description": 3,
-        "unit": 4,
-        "gen_duty": 16,
-        "vat": 17,
-        "cess": 20,
-        "excise": 21,
-        "sscl": 22,
-        "scl": 23,
-    }
+# pdfplumber table settings — these tables are fully ruled, so use the lines.
+TABLE_SETTINGS = {
+    "vertical_strategy":   "lines",
+    "horizontal_strategy": "lines",
+    "snap_tolerance":      3,
+    "join_tolerance":      3,
+}
 
-    for page in pdf.pages:
-        tables = page.extract_tables()
-        if not tables:
-            continue
-
-        for table in tables:
-            for row in table:
-                cleaned = [re.sub(r"\s+", " ", str(c or "")).strip().lower() for c in row]
-                if any("hs code" in c for c in cleaned):
-                    detected = {
-                        "heading": None,
-                        "code": None,
-                        "description": None,
-                        "unit": None,
-                        "gen_duty": None,
-                        "vat": None,
-                        "cess": None,
-                        "excise": None,
-                        "sscl": None,
-                        "scl": None,
-                    }
-                    for idx, text in enumerate(cleaned):
-                        if "hdg" in text or "heading" in text:
-                            detected["heading"] = idx
-                        elif "hs code" in text:
-                            detected["code"] = idx
-                        elif "desc" in text:
-                            detected["description"] = idx
-                        elif re.search(r"\bu\s*n\s*i\s*t\b", text):
-                            detected["unit"] = idx
-                        elif "gen" in text and "duty" in text:
-                            detected["gen_duty"] = idx
-                        elif text == "vat":
-                            detected["vat"] = idx
-                        elif text == "cess":
-                            detected["cess"] = idx
-                        elif "excise" in text:
-                            detected["excise"] = idx
-                        elif "sscl" in text:
-                            detected["sscl"] = idx
-                        elif text in ["s c l", "scl", "l c s"] or "special commodity" in text:
-                            detected["scl"] = idx
-
-                    if detected["code"] is not None and detected["description"] is not None:
-                        return detected
-
-    return cols
+# The ten preferential-duty (bilateral / regional trade-agreement) columns,
+# in the fixed order they appear in every chapter.
+PREF_COUNTRIES = ["AP", "AD", "BN", "GT", "IN", "PK", "SA", "SF", "SD", "SG"]
 
 
-def get_chapter_title_from_pdf(pdf_path):
-    """Extracts the real chapter title directly from the PDF's first page,
-    e.g. 'Chapter 27' followed by 'Mineral fuels, mineral oils...' --
-    matches the actual government document instead of a hand-typed guess."""
-    with pdfplumber.open(pdf_path) as pdf:
-        first_page_text = pdf.pages[0].extract_text()
+# ── Text helpers ─────────────────────────────────────────────────────────────
+def _norm(cell):
+    """Lower-cased, whitespace-collapsed version of a raw table cell."""
+    return re.sub(r"\s+", " ", str(cell or "")).strip().lower()
 
-    match = re.search(r"Chapter\s+(\d+)\s*\n(.+)", first_page_text)
-    if match:
-        chapter_number = int(match.group(1))
-        title = match.group(2).strip()
-        return chapter_number, title
 
-    return None, "Uncategorized"
+def _clean(cell):
+    """Single-line, trimmed text for storage; None when empty."""
+    if cell is None:
+        return None
+    text = re.sub(r"\s+", " ", str(cell).replace("\n", " ")).strip()
+    return text or None
+
+
+# ── Rate parsing ─────────────────────────────────────────────────────────────
+_NONE_TOKENS = {
+    "", "-", "--", "free", "ex", "ex.", "nil", "n/a", "na",
+    "con", "conditional", "exempt", "exempted",
+}
+
+_PER_UNIT_RE = re.compile(
+    r"per\s+(unit|pair|kwh?|kgm?|litre|liter|ltr|sqm|piece|pcs?|dozen|gram|gm?|"
+    r"mt|ton(?:ne)?|carat|no|nos|m)\b"
+)
+
+
+def _money(num_str, magnitude=None):
+    amount = float(num_str.replace(",", "").replace(" ", ""))
+    if magnitude in ("mn", "m", "million"):
+        amount *= 1_000_000
+    elif magnitude in ("bn", "billion"):
+        amount *= 1_000_000_000
+    return amount
 
 
 def parse_rate(value):
-    """Detects 'X% or Rs.Y per unit' patterns and returns a structured dict.
-    Every result includes 'raw' -- the exact original text from the PDF."""
-    if value is None or value.strip() == "":
+    """Turn a raw duty-cell string into a structured rate.
+
+    Handles the shapes that actually occur in the tariff:
+      "18%"                         -> percentage
+      "20.0%"                       -> percentage
+      "300%"                        -> percentage (yes, > 100 % happens)
+      "Rs.50/= per unit"            -> flat, perUnit="unit"
+      "Rs.7,243,550/- per unit"     -> flat (thousands separators, /- suffix)
+      "Rs 5.0 Mn"                   -> flat 5_000_000
+      "12% or Rs.160/= per unit"    -> whichever_higher (percentage + flat)
+      "Free" / "Ex" / "-" / ""      -> none
+    Every result keeps 'raw' — the exact original text.
+    """
+    if value is None:
         return {"type": "none", "value": 0.0, "raw": None}
 
-    raw_original = value.strip()
-    text = re.sub(r"\s+", " ", raw_original).lower()
+    raw = str(value).strip()
+    text = re.sub(r"\s+", " ", raw).lower().replace("/=", "").replace("/-", "")
+    # PDF text extraction sometimes splits thousands groups ("2,25 0,000"),
+    # so drop any comma/space that sits between two digits.
+    text = re.sub(r"(?<=\d)[ ,](?=\d)", "", text)
 
-    if text in ("free", "ex", "ex.", "nil", "-", "con", "conditional"):
-        return {"type": "none", "value": 0.0, "raw": raw_original}
+    if text in _NONE_TOKENS:
+        return {"type": "none", "value": 0.0, "raw": raw}
 
-    or_match = re.search(
-        r"(\d+(?:\.\d+)?)\s*%\s*or\s*rs\.?\s*(\d+(?:\.\d+)?)", text
+    per_match = _PER_UNIT_RE.search(text)
+    per_unit = per_match.group(1) if per_match else None
+
+    # "X% or Rs.Y ..."  → whichever is higher
+    m = re.search(
+        r"(\d+(?:\.\d+)?)\s*%\s*or\s*rs\.?\s*([\d,]+(?:\.\d+)?)\s*(mn|m|million|bn|billion)?",
+        text,
     )
-    if or_match:
+    if m:
         return {
             "type": "whichever_higher",
-            "percentage": float(or_match.group(1)) / 100,
-            "flatAmount": float(or_match.group(2)),
-            "raw": raw_original,
+            "percentage": float(m.group(1)) / 100,
+            "flatAmount": _money(m.group(2), m.group(3)),
+            "perUnit": per_unit,
+            "raw": raw,
         }
 
-    percent_match = re.match(r"^(\d+(?:\.\d+)?)\s*%$", text)
-    if percent_match:
-        return {
-            "type": "percentage",
-            "value": float(percent_match.group(1)) / 100,
-            "raw": raw_original,
-        }
-
-    flat_match = re.search(r"rs\.?\s*(\d+(?:\.\d+)?)", text)
-    if flat_match:
+    # "Rs.Y ..." (also "Rs 5.0 Mn")
+    m = re.search(r"rs\.?\s*([\d,]+(?:\.\d+)?)\s*(mn|m|million|bn|billion)?", text)
+    if m:
         return {
             "type": "flat",
-            "flatAmount": float(flat_match.group(1)),
-            "raw": raw_original,
+            "flatAmount": _money(m.group(1), m.group(2)),
+            "perUnit": per_unit,
+            "raw": raw,
         }
 
-    return {"type": "unknown", "raw": raw_original}
+    # plain percentage anywhere in the cell
+    m = re.search(r"(\d+(?:\.\d+)?)\s*%", text)
+    if m:
+        return {"type": "percentage", "value": float(m.group(1)) / 100, "raw": raw}
+
+    return {"type": "unknown", "raw": raw}
+
+
+# ── Chapter title ────────────────────────────────────────────────────────────
+def get_chapter_title_from_pdf(pdf_path):
+    """Reads 'Chapter NN' + the title line(s) from the PDF's first page so the
+    category matches the real government document, not a hand-typed guess."""
+    with pdfplumber.open(pdf_path) as pdf:
+        first_page_text = pdf.pages[0].extract_text() or ""
+
+    match = re.search(
+        r"Chapter\s+(\d+)\s*\n+([^\n]+(?:\n[^\n]+){0,2})", first_page_text
+    )
+    if not match:
+        return None, "Uncategorized"
+
+    chapter_number = int(match.group(1))
+    title = re.sub(r"\s+", " ", match.group(2)).strip()
+    # Drop anything from a "Note." / "Notes." onwards if it bled into the capture
+    title = re.split(r"\bnotes?\.", title, flags=re.IGNORECASE)[0].strip(" .,;")
+    return chapter_number, title
+
+
+# ── Column map (per table header) ────────────────────────────────────────────
+def build_column_map(table):
+    """Find the two-row header inside one extracted table and map every column
+    we care about to its index.  Returns None if this table has no header
+    (a continuation table on a later page)."""
+    label_row = None
+    sub_row = None
+    for i, row in enumerate(table):
+        cells = [_norm(c) for c in row]
+        if any("hs code" in c for c in cells):
+            label_row = cells
+            sub_row = [_norm(c) for c in table[i + 1]] if i + 1 < len(table) else []
+            break
+    if label_row is None:
+        return None
+
+    def find(pred):
+        for idx, text in enumerate(label_row):
+            if text and pred(text):
+                return idx
+        return None
+
+    m = {
+        "heading":     find(lambda c: "hdg" in c or c == "heading"),
+        "code":        find(lambda c: "hs code" in c),
+        "description": find(lambda c: c.startswith("desc")),
+        "unit":        find(lambda c: c == "unit" or re.fullmatch(r"un\s*it", c)),
+        "icl_slsi":    find(lambda c: "icl" in c),
+        "gen_duty":    find(lambda c: "gen" in c and "duty" in c),
+        "vat":         find(lambda c: c == "vat"),
+        "pal":         find(lambda c: c == "pal"),
+        "cess":        find(lambda c: c == "cess"),
+        "excise":      find(lambda c: "excise" in c),
+        "scd":         find(lambda c: "surcharge" in c),  # Surcharge on Customs Duty
+        "sscl":        find(lambda c: "sscl" in c),
+        "scl":         find(lambda c: c in ("s c l", "l c s", "scl", "lcs")
+                                      or "special commodity" in c),
+        "luxury":      find(lambda c: "luxury" in c),     # Chapter 87 only
+    }
+
+    if m["code"] is None or m["description"] is None:
+        return None
+
+    labelled = {v for v in m.values() if v is not None}
+
+    # Preferential-duty country sub-columns, read from the sub-label row.
+    # "SG" also names the PAL / Cess sub-columns further right, so keep only the
+    # first (left-most) occurrence of each code — that is the real country block.
+    prefs = {}
+    for idx, text in enumerate(sub_row):
+        code = text.upper()
+        if code in PREF_COUNTRIES and code not in prefs:
+            prefs[code] = idx
+    m["preferential"] = prefs
+
+    # PAL and Cess each carry an unlabelled "SG" sub-column immediately to the
+    # right of the labelled "Gen" column (only when that neighbour really is a
+    # sub-column and not the next labelled duty).
+    def sg_sub(base):
+        if base is None:
+            return None
+        nxt = base + 1
+        if nxt in labelled:
+            return None
+        if nxt < len(sub_row) and sub_row[nxt] in ("sg", "gen"):
+            return nxt
+        return None
+
+    m["pal_sg"]  = sg_sub(m["pal"])
+    m["cess_sg"] = sg_sub(m["cess"])
+
+    # Luxury Tax spans two columns: "Free threshold Value" then
+    # "Rate on the amount exceeding …".
+    m["luxury_rate"] = m["luxury"] + 1 if m["luxury"] is not None else None
+
+    # The dash-marker column ("-", "--", "---") sits between the code and the
+    # description and carries the outline depth of each row.
+    m["marker"] = (m["code"] + 1
+                   if m["description"] == m["code"] + 2
+                   else None)
+
+    return m
+
+
+# ── Row extraction ──────────────────────────────────────────────────────────
+_CODE_RE     = re.compile(r"^(\d{4}\.\d{2}(?:\.\d{2,3})?)\b(.*)$")
+_HEADING_RE  = re.compile(r"^\d{1,4}\.\d{2}$")
+_DASHES_RE   = re.compile(r"^([-–—]+)")
+# A repeating page header sometimes collides with the first data row, leaving a
+# cell like "HS Code 8703.23.80" or "Description Motor cars …".
+_LABEL_PREFIX_RE = re.compile(r"^(hs\s*code|hs\s*hdg|description|un\s*it)\s+", re.I)
+# Generic sub-category labels that add no meaning to the search text.
+_GENERIC_LABELS = {"other", "others"}
+
+
+def _cell(row, idx):
+    if idx is None or idx >= len(row):
+        return None
+    return _clean(row[idx])
+
+
+def _outline_depth(row, colmap, desc):
+    """Outline nesting depth of a row: 1 for '-', 2 for '--', 3 for '---', …
+
+    Reads the dedicated marker column, falling back to leading dashes on the
+    description when pdfplumber merges that column away."""
+    raw = _cell(row, colmap.get("marker"))
+    if raw and set(raw) <= {"-", "–", "—"}:
+        return len(raw)
+    mm = _DASHES_RE.match(desc or "")
+    return len(mm.group(1)) if mm else 0
+
+
+def _rate(row, idx):
+    return parse_rate(_cell(row, idx))
 
 
 def extract_codes_from_pdf(pdf_path):
-    """Extracts all valid product-level HS codes from one PDF file,
-    dynamically detecting the column layout for this specific file."""
-    extracted = []
+    """Extract every product-level HS code from one chapter PDF."""
     chapter_number, category = get_chapter_title_from_pdf(pdf_path)
+    source_file = os.path.basename(pdf_path)
 
+    records = []
+    colmap = None
     current_heading = None
-    current_heading_description = None
+    current_heading_desc = None
+    # Stack of (depth, label) for the "- Sheep :" / "- Liquefied :" style
+    # sub-category rows that sit between a heading and its product codes.
+    subcats = []
 
-    def get_cell(row, col_idx):
-        """Safely gets text from a row at col_idx if column exists."""
-        if col_idx is not None and col_idx < len(row) and row[col_idx] is not None:
-            val = str(row[col_idx]).strip()
-            return val if val else None
-        return None
+    def ancestor_path(depth):
+        return [label for d, label in subcats
+                if d < depth and label.lower() not in _GENERIC_LABELS]
+
+    def push_subcat(depth, label):
+        subcats[:] = [s for s in subcats if s[0] < depth]
+        if label:
+            subcats.append((depth, label))
 
     with pdfplumber.open(pdf_path) as pdf:
-        cols = detect_columns_from_pdf(pdf)
-        col_code = cols.get("code")
-        col_desc = cols.get("description")
-        col_hdg  = cols.get("heading")
-
         for page in pdf.pages:
-            tables = page.extract_tables()
-            if not tables:
-                continue
-
-            for row in tables[0]:
-                if col_code is None or col_desc is None:
-                    continue
-                if len(row) <= max(col_code, col_desc):
+            for table in page.extract_tables(TABLE_SETTINGS) or []:
+                header_map = build_column_map(table)
+                if header_map:
+                    colmap = header_map
+                if colmap is None:
                     continue
 
-                heading_raw = get_cell(row, col_hdg)
-                code_raw    = get_cell(row, col_code)
-                description = get_cell(row, col_desc)
+                for row in table:
+                    # Skip the header rows themselves — including the rare case
+                    # where a page header collides with the first data row and
+                    # its rate cells are actually column labels.
+                    if any("hs code" in _norm(c) for c in row):
+                        continue
 
-                # A heading row (e.g. "27.11") has a heading value but no code
-                if heading_raw and not code_raw:
-                    current_heading = heading_raw
-                    current_heading_description = (
-                        description.replace("\n", " ").strip() if description else None
-                    )
-                    continue
+                    heading_raw = _cell(row, colmap["heading"])
+                    code_raw    = _cell(row, colmap["code"])
+                    desc_raw    = _cell(row, colmap["description"])
 
-                if not code_raw or not description:
-                    continue
+                    if code_raw:
+                        code_raw = _LABEL_PREFIX_RE.sub("", code_raw)
+                    if desc_raw:
+                        desc_raw = _LABEL_PREFIX_RE.sub("", desc_raw)
 
-                if not re.match(r"^\d{2,4}\.\d{2}", code_raw):
-                    continue  # skip section headings, blank rows
+                    # A code cell can arrive merged with dashes / description,
+                    # e.g. "8703.33.79 ---- Other" — split the real code off.
+                    code = None
+                    if code_raw:
+                        mm = _CODE_RE.match(code_raw)
+                        if mm:
+                            code = mm.group(1)
+                            trailing = mm.group(2).strip(" -–—:")
+                            if not desc_raw and trailing:
+                                desc_raw = _clean(trailing)
 
-                description_clean = description.replace("\n", " ").strip()
+                    # Heading row: a heading number, no product code.
+                    if not code and heading_raw and _HEADING_RE.match(heading_raw):
+                        current_heading = heading_raw
+                        current_heading_desc = desc_raw
+                        subcats.clear()
+                        continue
 
-                extracted.append({
-                    "code":               code_raw,
-                    "description":        description_clean,
-                    "heading":            current_heading,
-                    "headingDescription": current_heading_description,
-                    "category":           category,
-                    "unit":               get_cell(row, cols.get("unit")),
-                    "cid_rate":           parse_rate(get_cell(row, cols.get("gen_duty"))),
-                    "vat_rate":           parse_rate(get_cell(row, cols.get("vat"))),
-                    "cess_rate":          parse_rate(get_cell(row, cols.get("cess"))),
-                    "excise_rate":        parse_rate(get_cell(row, cols.get("excise"))),
-                    "sscl_rate":          parse_rate(get_cell(row, cols.get("sscl"))),
-                    "scl_rate":           parse_rate(get_cell(row, cols.get("scl"))),
-                    "compliance":         [],
-                    "sourceFile":         os.path.basename(pdf_path),
-                })
+                    if not code:
+                        # Sub-category label row ("- Sheep :", "- Liquefied :").
+                        # Not a product itself, but context for the codes below.
+                        if desc_raw:
+                            depth = _outline_depth(row, colmap, desc_raw)
+                            if depth > 0:
+                                label = _DASHES_RE.sub("", desc_raw).strip(" :–—-").strip()
+                                push_subcat(depth, label)
+                        continue
 
-    return extracted
+                    # Outline context: the "- Sheep :" / "- Liquefied :" labels
+                    # that this code sits under. A code row whose description
+                    # ends with ":" (e.g. "8415.90.10 --- Outdoor units … :") is
+                    # itself a grouping label for the codes that follow.
+                    depth = _outline_depth(row, colmap, desc_raw) or code.count(".") + 1
+                    classification_path = ancestor_path(depth)
+                    if desc_raw and desc_raw.rstrip().endswith(":"):
+                        push_subcat(depth, desc_raw.rstrip(" :–—-").strip())
+
+                    luxury = None
+                    if colmap["luxury"] is not None:
+                        threshold_raw = _cell(row, colmap["luxury"])
+                        luxury = {
+                            "freeThreshold":    threshold_raw,
+                            "freeThresholdAmount": parse_rate(threshold_raw).get("flatAmount"),
+                            "rateOnExcess":     _rate(row, colmap["luxury_rate"]),
+                        }
+
+                    preferential = {
+                        country: parse_rate(_cell(row, idx))
+                        for country, idx in colmap["preferential"].items()
+                    }
+
+                    records.append({
+                        "code":               code,
+                        "description":        desc_raw or "",
+                        "heading":            current_heading,
+                        "headingDescription": current_heading_desc,
+                        "classificationPath": classification_path,
+                        "chapter":            chapter_number,
+                        "category":           category,
+                        "unit":               _cell(row, colmap["unit"]),
+                        "iclSlsi":            _cell(row, colmap["icl_slsi"]),
+                        # National duties
+                        "cid_rate":           _rate(row, colmap["gen_duty"]),
+                        "vat_rate":           _rate(row, colmap["vat"]),
+                        "pal_rate":           _rate(row, colmap["pal"]),
+                        "pal_sg_rate":        _rate(row, colmap["pal_sg"]),
+                        "cess_rate":          _rate(row, colmap["cess"]),
+                        "cess_sg_rate":       _rate(row, colmap["cess_sg"]),
+                        "excise_rate":        _rate(row, colmap["excise"]),
+                        "scd_rate":           _rate(row, colmap["scd"]),
+                        "sscl_rate":          _rate(row, colmap["sscl"]),
+                        "scl_rate":           _rate(row, colmap["scl"]),
+                        "luxuryTax":          luxury,
+                        # Trade-agreement preferential rates
+                        "preferential":       preferential,
+                        "compliance":         [],
+                        "sourceFile":         source_file,
+                    })
+
+    return _drop_parent_headings(records)
 
 
-def already_in_pinecone(codes_batch):
-    """Returns a set of HS code strings that already have vectors in Pinecone."""
+def _drop_parent_headings(records):
+    """Remove six-digit parents whose only role is to group their eight/ten-digit
+    children (e.g. 8501.10 when 8501.10.10 / 8501.10.90 exist), and rows that
+    carry no unit and no real rate (mis-captured label rows)."""
+    # De-duplicate by code, preferring the row with the most information.
+    by_code = {}
+    for rec in records:
+        prev = by_code.get(rec["code"])
+        if prev is None or _info_score(rec) > _info_score(prev):
+            by_code[rec["code"]] = rec
+
+    codes = set(by_code)
+
+    def is_parent(code):
+        prefix = code + "."
+        return any(other != code and other.startswith(prefix) for other in codes)
+
+    kept = []
+    for code, rec in by_code.items():
+        if is_parent(code):
+            continue
+        if rec["unit"] is None and not _has_real_rate(rec):
+            continue
+        kept.append(rec)
+
+    kept.sort(key=lambda r: r["code"])
+    return kept
+
+
+_RATE_FIELDS = (
+    "cid_rate", "vat_rate", "pal_rate", "cess_rate",
+    "excise_rate", "scd_rate", "sscl_rate", "scl_rate",
+)
+
+
+def _has_real_rate(rec):
+    return any(rec[f].get("type") not in ("none", "unknown") for f in _RATE_FIELDS)
+
+
+def _info_score(rec):
+    score = 0
+    if rec["unit"]:
+        score += 1
+    score += sum(1 for f in _RATE_FIELDS if rec[f].get("type") not in ("none", "unknown"))
+    score += len(rec["description"]) / 100
+    return score
+
+
+# ── Embedding text ──────────────────────────────────────────────────────────
+def build_embedding_text(rec):
+    """[sub-category …] | description | headingDescription | category —
+    the searchable summary. The sub-category labels ("Sheep", "Liquefied")
+    are what separate otherwise-identical siblings such as 0104.10.10 and
+    0104.20.10, both "Pure-bred breeding animals"."""
+    parts = list(rec.get("classificationPath") or [])
+    parts.append(rec["description"])
+    if rec.get("headingDescription"):
+        parts.append(rec["headingDescription"])
+    if rec.get("category"):
+        parts.append(rec["category"])
+    return " | ".join(p for p in parts if p)
+
+
+# ── Pinecone ────────────────────────────────────────────────────────────────
+def get_pinecone_index():
+    from pinecone import Pinecone
+
+    pc = Pinecone(api_key=PINECONE_API_KEY)
+
+    if not pc.has_index(PINECONE_INDEX_NAME):
+        print(f"Creating Pinecone index '{PINECONE_INDEX_NAME}' with integrated "
+              f"model '{PINECONE_MODEL}' ...")
+        pc.create_index_for_model(
+            name=PINECONE_INDEX_NAME,
+            cloud="aws",
+            region="us-east-1",
+            embed={
+                "model":     PINECONE_MODEL,
+                "metric":    "cosine",
+                "field_map": {"text": "text"},
+            },
+        )
+        while not pc.describe_index(PINECONE_INDEX_NAME).status["ready"]:
+            time.sleep(1)
+        print("Index ready.")
+
+    return pc.Index(PINECONE_INDEX_NAME)
+
+
+def already_in_pinecone(index, codes_batch):
+    """Set of HS code strings that already have a record in the index."""
     ids = [item["code"] for item in codes_batch]
     try:
-        response = pinecone_index.fetch(ids=ids)
+        response = index.fetch(ids=ids, namespace=PINECONE_NAMESPACE)
         return set(response.vectors.keys())
     except Exception:
         return set()
 
 
-def embed_texts(texts, input_type="passage"):
-    """
-    Call Pinecone's inference API to embed a list of strings.
-    input_type = "passage"  when indexing documents
-    input_type = "query"    when embedding a search query
-    Returns a list of float vectors.
-    """
-    response = pc.inference.embed(
-        model=EMBED_MODEL,
-        inputs=texts,
-        parameters={"input_type": input_type, "truncate": "END"},
-    )
-    return [item["values"] for item in response]
-
-
+# ── Seed pipeline ───────────────────────────────────────────────────────────
 def seed_with_resumability(codes):
     """
-    Two-phase pipeline per HS code:
-      1. Write structured data (NO embedding) to Firestore.
-      2. Embed with Pinecone inference -> upsert vectors to Pinecone.
-
-    Processes in batches of UPSERT_BATCH for efficiency.
-    Already-completed codes (present in Pinecone) are skipped on re-runs.
+    Two-phase pipeline:
+      1. Write structured data to Firestore for every code.
+      2. Upsert a text record per code to Pinecone, which embeds it server-side
+         with the index's integrated model. Codes that already have a record
+         are skipped (safe to re-run).
     """
-    newly_seeded = 0
-    already_done = 0
+    index = get_pinecone_index()
 
-    # Pre-fetch which codes are already in Pinecone (checked in chunks of 50)
     already_done_ids = set()
     for i in range(0, len(codes), 50):
-        already_done_ids |= already_in_pinecone(codes[i : i + 50])
+        already_done_ids |= already_in_pinecone(index, codes[i : i + 50])
+    print(f"{len(already_done_ids)} codes already in Pinecone — will skip them.")
 
-    print(f"{len(already_done_ids)} codes already in Pinecone -- will skip them.")
-
-    # Filter to only codes that need embedding
-    pending = [item for item in codes if item["code"] not in already_done_ids]
+    pending = [c for c in codes if c["code"] not in already_done_ids]
     already_done = len(codes) - len(pending)
 
-    # -- Phase 1: Write ALL codes to Firestore (data only, no embedding) -----
+    # Phase 1 — Firestore (data only)
     print(f"\nWriting {len(codes)} codes to Firestore ...")
-    for item in codes:
+    for i, item in enumerate(codes, 1):
         db.collection("hscodes").document(item["code"]).set(item)
+        if i % 200 == 0:
+            print(f"  {i}/{len(codes)} written ...")
     print("Firestore write complete.")
 
-    # -- Phase 2: Embed & upsert in batches to Pinecone ----------------------
-    print(f"\nEmbedding and upserting {len(pending)} codes to Pinecone ...")
-    for batch_start in range(0, len(pending), UPSERT_BATCH):
-        batch = pending[batch_start : batch_start + UPSERT_BATCH]
-
-        # Build the text to embed: description | headingDescription | category
-        texts = []
-        for item in batch:
-            parts = [item["description"]]
-            if item.get("headingDescription"):
-                parts.append(item["headingDescription"])
-            if item.get("category"):
-                parts.append(item["category"])
-            texts.append(" | ".join(parts))
+    # Phase 2 — upsert text records; Pinecone embeds them with PINECONE_MODEL
+    print(f"\nUpserting {len(pending)} text records to Pinecone ...")
+    newly_seeded = 0
+    for start in range(0, len(pending), UPSERT_BATCH):
+        batch = pending[start : start + UPSERT_BATCH]
 
         try:
-            vectors = embed_texts(texts, input_type="passage")
+            index.upsert_records(namespace=PINECONE_NAMESPACE, records=[
+                {
+                    "_id":         item["code"],
+                    "text":        build_embedding_text(item),
+                    "description": item["description"][:1000],
+                    "category":    item.get("category") or "",
+                    "heading":     item.get("heading") or "",
+                    "chapter":     item.get("chapter") or 0,
+                    "subCategory": " > ".join(item.get("classificationPath") or []),
+                }
+                for item in batch
+            ])
         except Exception as e:
-            print(f"Pinecone embed failed for batch starting at {batch_start}: {e}")
+            print(f"  upsert failed for batch at {start}: {e}")
             continue
 
-        upsert_payload = [
-            {
-                "id": batch[i]["code"],
-                "values": vectors[i],
-                "metadata": {
-                    "description": batch[i]["description"],
-                    "category":    batch[i].get("category", ""),
-                    "heading":     batch[i].get("heading", ""),
-                },
-            }
-            for i in range(len(batch))
-        ]
-
-        pinecone_index.upsert(vectors=upsert_payload)
         newly_seeded += len(batch)
-        print(f"  Upserted {newly_seeded}/{len(pending)} vectors ...")
-
+        print(f"  upserted {newly_seeded}/{len(pending)} records ...")
         time.sleep(0.1)
 
-    print(f"\nDone.")
-    print(f"Newly embedded + upserted to Pinecone: {newly_seeded}")
-    print(f"Already had vectors (skipped):          {already_done}")
+    print("\nDone.")
+    print(f"Newly upserted to Pinecone:   {newly_seeded}")
+    print(f"Already present (skipped):     {already_done}")
+
+
+# ── Dry run ─────────────────────────────────────────────────────────────────
+def dry_run(all_codes):
+    """Parse only — print coverage stats and a few sample rows, write nothing."""
+    print(f"\nTotal product codes extracted: {len(all_codes)}\n")
+    fields = [
+        ("cid_rate", "CID"), ("vat_rate", "VAT"), ("pal_rate", "PAL"),
+        ("cess_rate", "Cess"), ("excise_rate", "Excise"), ("scd_rate", "SCD"),
+        ("sscl_rate", "SSCL"), ("scl_rate", "SCL"),
+    ]
+    for key, name in fields:
+        present = sum(1 for c in all_codes if c[key].get("type") not in ("none", "unknown"))
+        print(f"  {name:6}: {present:5}/{len(all_codes)} rows have a real rate")
+    lux = sum(1 for c in all_codes if c.get("luxuryTax") and c["luxuryTax"]["freeThreshold"])
+    print(f"  Luxury: {lux:5} rows have a threshold")
+    paths = sum(1 for c in all_codes if c.get("classificationPath"))
+    print(f"  Sub-cat:{paths:5} rows carry a sub-category path")
+
+    print("\nSample rows:")
+    for c in all_codes[:3] + all_codes[len(all_codes) // 2 : len(all_codes) // 2 + 3]:
+        print(f"\n  {c['code']}  {c['description'][:70]}")
+        print(f"    chapter={c['chapter']} heading={c['heading']} unit={c['unit']}")
+        if c.get("classificationPath"):
+            print(f"    path={c['classificationPath']}")
+        print(f"    embed: {build_embedding_text(c)[:110]}")
+        for key, name in fields:
+            r = c[key]
+            if r.get("type") not in ("none", "unknown"):
+                print(f"    {name:6}: {r}")
 
 
 if __name__ == "__main__":
-    pdf_files = glob.glob(os.path.join(PDF_FOLDER, "*.pdf"))
+    dry = "--dry-run" in sys.argv
+
+    pdf_files = sorted(glob.glob(os.path.join(PDF_FOLDER, "*.pdf")))
     print(f"Found {len(pdf_files)} PDF files in '{PDF_FOLDER}'.")
 
     all_codes = []
     for pdf_path in pdf_files:
-        if len(all_codes) >= MAX_TOTAL_CODES:
+        if MAX_TOTAL_CODES is not None and len(all_codes) >= MAX_TOTAL_CODES:
             break
-        codes     = extract_codes_from_pdf(pdf_path)
-        remaining = MAX_TOTAL_CODES - len(all_codes)
-        codes     = codes[:remaining]
-        print(f"  {os.path.basename(pdf_path)}: {len(codes)} codes extracted")
+        codes = extract_codes_from_pdf(pdf_path)
+        if MAX_TOTAL_CODES is not None:
+            codes = codes[: MAX_TOTAL_CODES - len(all_codes)]
+        print(f"  {os.path.basename(pdf_path)}: {len(codes)} codes")
         all_codes.extend(codes)
 
-    print(f"\nTotal codes extracted: {len(all_codes)} (limit: {MAX_TOTAL_CODES})")
-    seed_with_resumability(all_codes)
+    print(f"\nTotal codes extracted: {len(all_codes)}"
+          + (f" (limit: {MAX_TOTAL_CODES})" if MAX_TOTAL_CODES is not None else ""))
+
+    if dry:
+        dry_run(all_codes)
+    else:
+        seed_with_resumability(all_codes)

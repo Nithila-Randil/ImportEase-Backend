@@ -11,9 +11,8 @@ router = APIRouter()
 
 load_dotenv()
 PINECONE_API_KEY    = os.getenv("PINECONE_API_KEY")
-PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "importease-hscodes")
-
-EMBED_MODEL = "multilingual-e5-large"
+PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "hscode-embeddings")
+PINECONE_NAMESPACE  = "__default__"
 
 pc             = Pinecone(api_key=PINECONE_API_KEY)
 pinecone_index = pc.Index(PINECONE_INDEX_NAME)
@@ -25,50 +24,42 @@ pinecone_index = pc.Index(PINECONE_INDEX_NAME)
 
 @router.get("/hscodes/search")
 def search_hscodes(q: str = Query(..., description="Plain-language product description")):
-    """Semantic search using Pinecone inference + Pinecone query.
+    """Semantic search over the HS code catalogue.
 
     Flow:
-      1. Pinecone embeds the user's query (input_type='query').
-      2. Pinecone performs cosine-similarity internally and returns top-10 IDs.
-      3. Fetch each matching document from Firestore to get full details.
-      4. Return combined result list (with similarity score).
+      1. Pinecone embeds the query with the index's integrated model
+         (llama-text-embed-v2) and returns the top-10 nearest records.
+      2. Fetch each matching document from Firestore for full detail.
+      3. Return the combined list, ordered by similarity score.
     """
 
-    # Step 1 -- embed the search query using Pinecone inference
-    embed_response = pc.inference.embed(
-        model=EMBED_MODEL,
-        inputs=[q],
-        parameters={"input_type": "query", "truncate": "END"},
-    )
-    query_vector = embed_response[0]["values"]
-
-    # Step 2 -- Pinecone cosine similarity query; returns top-10 matches
-    pinecone_response = pinecone_index.query(
-        vector=query_vector,
-        top_k=10,
-        include_metadata=True,
+    # Step 1 -- Pinecone embeds the text and runs the similarity search
+    response = pinecone_index.search(
+        namespace=PINECONE_NAMESPACE,
+        query={"inputs": {"text": q}, "top_k": 10},
+        fields=["description", "category", "heading", "subCategory"],
     )
 
-    matches = pinecone_response.get("matches", [])
-    if not matches:
+    hits = response["result"]["hits"]
+    if not hits:
         return []
 
-    # Step 3 -- fetch full records from Firestore using the returned IDs
+    # Step 2 -- fetch full records from Firestore using the returned IDs
     results = []
-    for match in matches:
-        hs_code = match["id"]
-        score   = match["score"]
+    for hit in hits:
+        hs_code = hit["id"]
+        score   = round(hit["score"], 4)
+        fields  = hit.get("fields", {})
 
         doc = db.collection("hscodes").document(hs_code).get()
         if not doc.exists:
-            # Fallback: use metadata stored in Pinecone if Firestore doc missing
-            meta = match.get("metadata", {})
+            # Fallback: use the fields stored on the Pinecone record
             results.append({
                 "code":               hs_code,
-                "description":        meta.get("description", ""),
+                "description":        fields.get("description", ""),
                 "headingDescription": "",
-                "category":           meta.get("category", ""),
-                "score":              round(score, 4),
+                "category":           fields.get("category", ""),
+                "score":              score,
                 "source":             "pinecone_only",
             })
             continue
@@ -76,10 +67,11 @@ def search_hscodes(q: str = Query(..., description="Plain-language product descr
         data = doc.to_dict()
         results.append({
             "code":               data.get("code"),
-            "description":        data.get("description"),
             "headingDescription": data.get("headingDescription"),
             "category":           data.get("category"),
-            "score":              round(score, 4),
+            "description":        data.get("description"),
+            "classificationPath": data.get("classificationPath"),
+            "score":              score,
         })
 
     return results
