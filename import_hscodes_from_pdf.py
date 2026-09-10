@@ -59,7 +59,7 @@ PINECONE_MODEL     = "llama-text-embed-v2"   # 1024-dim, 2048-token input
 PINECONE_NAMESPACE = "__default__"
 
 PDF_FOLDER      = "tariff_pdfs"
-MAX_TOTAL_CODES = 480   # how many codes to process; None = all of them
+MAX_TOTAL_CODES = 5   # how many codes to process; None = all of them
 UPSERT_BATCH    = 96     # Pinecone embeds at most 96 records per upsert_records call
 
 # pdfplumber table settings — these tables are fully ruled, so use the lines.
@@ -419,9 +419,9 @@ def extract_codes_from_pdf(pdf_path):
                         # National duties
                         "cid_rate":           _rate(row, colmap["gen_duty"]),
                         "vat_rate":           _rate(row, colmap["vat"]),
-                        "pal_rate":           _rate(row, colmap["pal"]),
+                        "pal_gen_rate":       _rate(row, colmap["pal"]),
                         "pal_sg_rate":        _rate(row, colmap["pal_sg"]),
-                        "cess_rate":          _rate(row, colmap["cess"]),
+                        "cess_gen_rate":      _rate(row, colmap["cess"]),
                         "cess_sg_rate":       _rate(row, colmap["cess_sg"]),
                         "excise_rate":        _rate(row, colmap["excise"]),
                         "scd_rate":           _rate(row, colmap["scd"]),
@@ -467,7 +467,7 @@ def _drop_parent_headings(records):
 
 
 _RATE_FIELDS = (
-    "cid_rate", "vat_rate", "pal_rate", "cess_rate",
+    "cid_rate", "vat_rate", "pal_gen_rate", "cess_gen_rate",
     "excise_rate", "scd_rate", "sscl_rate", "scl_rate",
 )
 
@@ -600,8 +600,8 @@ def dry_run(all_codes):
     """Parse only — print coverage stats and a few sample rows, write nothing."""
     print(f"\nTotal product codes extracted: {len(all_codes)}\n")
     fields = [
-        ("cid_rate", "CID"), ("vat_rate", "VAT"), ("pal_rate", "PAL"),
-        ("cess_rate", "Cess"), ("excise_rate", "Excise"), ("scd_rate", "SCD"),
+        ("cid_rate", "CID"), ("vat_rate", "VAT"), ("pal_gen_rate", "PAL"),
+        ("cess_gen_rate", "Cess"), ("excise_rate", "Excise"), ("scd_rate", "SCD"),
         ("sscl_rate", "SSCL"), ("scl_rate", "SCL"),
     ]
     for key, name in fields:

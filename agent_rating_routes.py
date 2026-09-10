@@ -27,7 +27,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from firebase_setup import db
-from dependencies import verify_token
+from dependencies import verify_token, require_role
 
 router = APIRouter()
 
@@ -41,7 +41,8 @@ class RatingCreate(BaseModel):
 
 
 @router.post("/shipments/{shipment_id}/rating")
-def rate_shipment(shipment_id: str, rating: RatingCreate, user: dict = Depends(verify_token)):
+def rate_shipment(shipment_id: str, rating: RatingCreate,
+                  user: dict = Depends(require_role("importer"))):
     """Importer rates the agent once the shipment is fully cleared."""
     doc = db.collection(SHIPMENTS_COLLECTION).document(shipment_id).get()
     if not doc.exists:

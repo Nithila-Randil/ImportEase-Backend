@@ -96,14 +96,24 @@ def get_hscode_detail(code: str):
 def get_landed_cost(
     code: str,
     value: float = Query(..., description="Declared CIF shipment value"),
-    origin: Optional[str] = None,
+    origin: Optional[str] = Query(
+        None,
+        description="Country of origin (e.g. 'India'). If it qualifies for a "
+                    "trade agreement with a lower duty on this code, that rate "
+                    "is used and reported in `cidBasis`.",
+    ),
 ):
+    """Estimated landed cost = CIF + government duties and taxes only.
+
+    The response carries `isEstimate: true` and a `disclaimer` string — it does
+    not include port, handling, clearing-agent, transport or bank charges.
+    """
     doc = db.collection("hscodes").document(code).get()
     if not doc.exists:
         raise HTTPException(status_code=404, detail="HS code not found")
 
     data      = doc.to_dict()
-    breakdown = calculate_landed_cost(data, value)
+    breakdown = calculate_landed_cost(data, value, origin=origin)
 
     return {"code": code, **breakdown}
 

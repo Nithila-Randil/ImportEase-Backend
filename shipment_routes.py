@@ -15,7 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from firebase_setup import db
-from dependencies import verify_token
+from dependencies import verify_token, require_role
 from notification_routes import create_notification
 
 router = APIRouter()
@@ -69,8 +69,8 @@ def _get_shipment_or_404(shipment_id: str):
 # ---------- Endpoints ----------
 
 @router.post("/shipments")
-def create_shipment(shipment: ShipmentCreate, user: dict = Depends(verify_token)):
-    """Any authenticated importer can create a shipment."""
+def create_shipment(shipment: ShipmentCreate, user: dict = Depends(require_role("importer"))):
+    """Only an importer can create a shipment."""
     doc_ref = db.collection(SHIPMENTS_COLLECTION).document()
 
     data = {
@@ -169,7 +169,8 @@ def get_shipment_status(shipment_id: str, user: dict = Depends(verify_token)):
 
 
 @router.put("/shipments/{shipment_id}/status")
-def update_shipment_status(shipment_id: str, status_update: StatusUpdate, user: dict = Depends(verify_token)):
+def update_shipment_status(shipment_id: str, status_update: StatusUpdate,
+                           user: dict = Depends(require_role("clearing_agent"))):
     """
     Only the ASSIGNED AGENT can advance a shipment's stage -- never the importer.
     The new stage must be exactly the next one in STAGE_ORDER: no skipping, no going backward.
