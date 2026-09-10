@@ -38,7 +38,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 
 from firebase_setup import db
-from dependencies import verify_token
+from dependencies import verify_token, require_role
 
 router = APIRouter()
 
@@ -114,7 +114,7 @@ async def upload_document(
     shipment_id: str,
     file: UploadFile = File(...),
     documentType: str = Form(...),
-    user: dict = Depends(verify_token),
+    user: dict = Depends(require_role("clearing_agent")),
 ):
     """Only the assigned agent can upload an official document/receipt."""
     shipment_data = _get_shipment_with_access(shipment_id, user)

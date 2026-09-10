@@ -1,0 +1,98 @@
+ImportEase — HS code duty/levy field reference
+==============================================
+
+The HS-code records (Firestore `hscodes` collection, produced by
+import_hscodes_from_pdf.py) carry short field keys. The long names are NOT
+stored anywhere in the data or code — this file is the reference.
+
+Names are taken from the "INDICATORS FOR PREFERENTIAL RATES OF DUTY" section
+and the levy definitions in the Sri Lanka Customs National Imports Tariff
+Guide preamble.
+
+
+NATIONAL DUTIES & LEVIES
+-----------------------------------------------------------------------------
+
+Field key            Tariff column          Full name / basis
+-------------------  ---------------------  ------------------------------------
+iclSlsi              ICL / SLSI             Import Control License (ICL) /
+                                            Sri Lanka Standards Institutions
+                                            (SLSI). Regulatory flag, NOT a tax.
+
+cid_rate             Gen Duty               General Rate of Duty /
+                                            Customs Import Duty (CID).
+
+vat_rate             VAT                    Value Added Tax.
+                                            VAT Act No. 14 of 2002.
+
+pal_gen_rate         PAL (Gen sub-column)   Ports and Airports Development Levy
+                                            — general rate.
+
+pal_sg_rate          PAL (SG sub-column)    Ports and Airports Development Levy
+                                            — rate for Singapore-origin goods
+                                            (Singapore-Sri Lanka FTA).
+
+cess_gen_rate        Cess (Gen sub-column)  Cess Levy (Sri Lanka Export
+                                            Development Act) — general rate.
+
+cess_sg_rate         Cess (SG sub-column)   Cess Levy — Singapore-origin rate.
+
+excise_rate          Excise (S.P.D)         Excise (Special Provisions) Duty.
+                                            Excise (Special Provisions) Act
+                                            No. 13 of 1989.
+
+scd_rate             Surcharge on           Surcharge on Customs Duty (SCD).
+                     Customs Duty           Appears only in some chapters
+                                            (61, 64, 84, 85, 87, 94).
+
+sscl_rate            SSCL                   Social Security Contribution Levy.
+
+scl_rate             S C L                  Special Commodity Levy.
+                                            Special Commodity Levy Act
+                                            No. 48 of 2007. When it applies it
+                                            REPLACES the whole standard stack.
+
+luxuryTax            Luxury Tax             Luxury Tax on motor vehicles
+  .freeThreshold       "Free threshold      (Chapter 87 only). CIF value below
+                        Value"              the threshold is exempt;
+  .freeThresholdAmount                      `rateOnExcess` is charged on the
+  .rateOnExcess         "Rate on the        portion of CIF above it.
+                        amount exceeding
+                        Luxury Tax Free
+                        Threshold"
+
+
+PREFERENTIAL (TRADE-AGREEMENT) DUTY COLUMNS
+-----------------------------------------------------------------------------
+Stored under `preferential.<code>` on each HS code.
+
+Code   Agreement
+-----  --------------------------------------------------------------
+AP     Asia-Pacific Trade Agreement (APTA)
+AD     APTA — Least Developed Countries (Bangladesh, Laos)
+BN     Imports from Bangladesh
+GT     Global System of Trade Preferences (GSTP)
+IN     Indo-Sri Lanka Free Trade Agreement (ISFTA)
+PK     Pakistan-Sri Lanka Free Trade Agreement (PSFTA)
+SA     SAARC countries (SAPTA)
+SF     South Asian Free Trade Area (SAFTA)
+SD     SAFTA — Least Developed Countries (Bangladesh, Bhutan, Maldives, Nepal)
+SG     Singapore-Sri Lanka Free Trade Agreement (SLSFTA)
+
+The full country lists per agreement live in PREFERENTIAL_AGREEMENTS in
+duty_calculator.py.
+
+
+NOTES ON THE PDF LAYOUT
+-----------------------------------------------------------------------------
+- Header row order, left to right:
+    ICL/SLSI | [Preferential Duty: AP AD BN GT IN PK SA SF SD SG] |
+    Gen Duty | VAT | PAL | Cess | Excise (S.P.D) |
+    [Surcharge on Customs Duty] | SSCL | S C L    (or Luxury Tax in Ch. 87)
+
+- "S C L" is printed stacked vertically in the PDF.
+- The PDF header spells it "threshhold" (double h); our field is
+  `freeThreshold`.
+- No single chapter contains every column. Chapters 84/85 have the full
+  standard stack (everything except Luxury Tax); Chapter 87 is the only one
+  with Luxury Tax (and has no SCL column).

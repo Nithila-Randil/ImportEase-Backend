@@ -26,7 +26,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from firebase_setup import db
-from dependencies import verify_token
+from dependencies import verify_token, require_role
 from notification_routes import create_notification
 
 router = APIRouter()
@@ -71,7 +71,7 @@ def _get_required_permits(hs_code: str):
 # ---------- Tenders ----------
 
 @router.post("/shipments/{shipment_id}/tender")
-def create_tender(shipment_id: str, user: dict = Depends(verify_token)):
+def create_tender(shipment_id: str, user: dict = Depends(require_role("importer"))):
     """Importer posts their (draft) shipment to the Clearing Agent Board."""
     shipment_ref, shipment_doc = _get_or_404(SHIPMENTS_COLLECTION, shipment_id, "Shipment not found")
     shipment_data = shipment_doc.to_dict()
