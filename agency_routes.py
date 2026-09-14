@@ -37,11 +37,16 @@ class AgentApprovalRequest(BaseModel):
 # ============================================================
 @router.post("/agencies/register")
 def register_agency(data: AgencyRegisterRequest):
-    user_record = auth.create_user(
-        email=data.email,
-        password=data.password,
-        display_name=data.companyName
-    )
+    try:
+        user_record = auth.create_user(
+            email=data.email,
+            password=data.password,
+            display_name=data.companyName
+        )
+    except auth.EmailAlreadyExistsError:
+        raise HTTPException(status_code=400, detail="An account with that email already exists")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
     agency_code = generate_agency_code()
     while find_agency_by_code(agency_code)[0] is not None:
@@ -70,6 +75,7 @@ def register_agency(data: AgencyRegisterRequest):
         "role": "clearing_agent",
         "agencyId": agency_id,
         "isAgencyAdmin": True,
+        "isIndependent": False,
         "agentStatus": "approved",
         "profileComplete": False,
         "phone": None

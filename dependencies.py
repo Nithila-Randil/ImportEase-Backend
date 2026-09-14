@@ -9,10 +9,37 @@ def verify_token(authorization: str = Header(...)):
     token (dict with uid, email, etc.) if valid, otherwise raises 401."""
     try:
         token = authorization.split(" ")[1]
-        decoded_token = auth.verify_id_token(token)
+        # clock_skew_seconds tolerates small drift between this machine's system
+        # clock and Google's token-issuance clock. Without it, verify_id_token
+        # rejects a token minted moments ago as "used too early" whenever the
+        # local clock runs even a few seconds fast -- which looks like random,
+        # intermittent "expired token" failures that clear up if you just retry.
+        decoded_token = auth.verify_id_token(token, clock_skew_seconds=10)
         return decoded_token
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+
+def require_platform_admin(user: dict = Depends(verify_token)):
+    """Dependency for ImportEase-staff-only routes (e.g. approving independent
+    clearing agents, who have no agency admin above them).
+
+    A platform admin is any user whose `users` document has
+    `isPlatformAdmin == True`. Grant it by setting that flag manually in the
+    Firestore console -- there is deliberately no self-service way to become one.
+
+    Returns the decoded token plus a `"profile"` key, same shape as
+    `require_role`.
+    """
+    doc = db.collection("users").document(user["uid"]).get()
+    if not doc.exists:
+        raise HTTPException(status_code=403, detail="User profile not found")
+
+    profile = doc.to_dict()
+    if not profile.get("isPlatformAdmin"):
+        raise HTTPException(status_code=403, detail="Platform administrator access required")
+
+    return {**user, "profile": profile}
 
 
 def require_role(*allowed_roles: str):
