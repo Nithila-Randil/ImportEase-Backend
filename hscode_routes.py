@@ -28,7 +28,7 @@ def search_hscodes(q: str = Query(..., description="Plain-language product descr
 
     Flow:
       1. Pinecone embeds the query with the index's integrated model
-         (llama-text-embed-v2) and returns the top-10 nearest records.
+         (llama-text-embed-v2) and returns the top-15 nearest records.
       2. Fetch each matching document from Firestore for full detail.
       3. Return the combined list, ordered by similarity score.
     """
@@ -36,8 +36,8 @@ def search_hscodes(q: str = Query(..., description="Plain-language product descr
     # Step 1 -- Pinecone embeds the text and runs the similarity search
     response = pinecone_index.search(
         namespace=PINECONE_NAMESPACE,
-        query={"inputs": {"text": q}, "top_k": 10},
-        fields=["description", "category", "heading", "subCategory"],
+        query={"inputs": {"text": q}, "top_k": 15},
+        fields=["description", "chapterTitle", "heading", "subCategory", "chapter"],
     )
 
     hits = response["result"]["hits"]
@@ -58,7 +58,8 @@ def search_hscodes(q: str = Query(..., description="Plain-language product descr
                 "code":               hs_code,
                 "description":        fields.get("description", ""),
                 "headingDescription": "",
-                "category":           fields.get("category", ""),
+                "chapterTitle":       fields.get("chapterTitle", ""),
+                "chapter":            fields.get("chapter"),
                 "score":              score,
                 "source":             "pinecone_only",
             })
@@ -68,7 +69,8 @@ def search_hscodes(q: str = Query(..., description="Plain-language product descr
         results.append({
             "code":               data.get("code"),
             "headingDescription": data.get("headingDescription"),
-            "category":           data.get("category"),
+            "chapterTitle":       data.get("chapterTitle"),
+            "chapter":            data.get("chapter"),
             "description":        data.get("description"),
             "classificationPath": data.get("classificationPath"),
             "score":              score,
@@ -85,10 +87,11 @@ def get_hscode_detail(code: str):
 
     data = doc.to_dict()
     return {
-        "code":        data.get("code"),
-        "description": data.get("description"),
-        "category":    data.get("category"),
-        "unit":        data.get("unit"),
+        "code":         data.get("code"),
+        "description":  data.get("description"),
+        "chapterTitle": data.get("chapterTitle"),
+        "chapter":      data.get("chapter"),
+        "unit":         data.get("unit"),
     }
 
 

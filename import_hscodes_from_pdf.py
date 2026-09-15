@@ -59,7 +59,7 @@ PINECONE_MODEL     = "llama-text-embed-v2"   # 1024-dim, 2048-token input
 PINECONE_NAMESPACE = "__default__"
 
 PDF_FOLDER      = "tariff_pdfs"
-MAX_TOTAL_CODES = 5   # how many codes to process; None = all of them
+MAX_TOTAL_CODES = None   # how many codes to process; None = all of them
 UPSERT_BATCH    = 96     # Pinecone embeds at most 96 records per upsert_records call
 
 # pdfplumber table settings — these tables are fully ruled, so use the lines.
@@ -310,7 +310,7 @@ def _rate(row, idx):
 
 def extract_codes_from_pdf(pdf_path):
     """Extract every product-level HS code from one chapter PDF."""
-    chapter_number, category = get_chapter_title_from_pdf(pdf_path)
+    chapter_number, chapter_title = get_chapter_title_from_pdf(pdf_path)
     source_file = os.path.basename(pdf_path)
 
     records = []
@@ -413,7 +413,7 @@ def extract_codes_from_pdf(pdf_path):
                         "headingDescription": current_heading_desc,
                         "classificationPath": classification_path,
                         "chapter":            chapter_number,
-                        "category":           category,
+                        "chapterTitle":       chapter_title,
                         "unit":               _cell(row, colmap["unit"]),
                         "iclSlsi":            _cell(row, colmap["icl_slsi"]),
                         # National duties
@@ -487,7 +487,7 @@ def _info_score(rec):
 
 # ── Embedding text ──────────────────────────────────────────────────────────
 def build_embedding_text(rec):
-    """[sub-category …] | description | headingDescription | category —
+    """[sub-category …] | description | headingDescription | chapterTitle —
     the searchable summary. The sub-category labels ("Sheep", "Liquefied")
     are what separate otherwise-identical siblings such as 0104.10.10 and
     0104.20.10, both "Pure-bred breeding animals"."""
@@ -495,8 +495,8 @@ def build_embedding_text(rec):
     parts.append(rec["description"])
     if rec.get("headingDescription"):
         parts.append(rec["headingDescription"])
-    if rec.get("category"):
-        parts.append(rec["category"])
+    if rec.get("chapterTitle"):
+        parts.append(rec["chapterTitle"])
     return " | ".join(p for p in parts if p)
 
 
@@ -559,6 +559,9 @@ def seed_with_resumability(codes):
     print(f"\nWriting {len(codes)} codes to Firestore ...")
     for i, item in enumerate(codes, 1):
         db.collection("hscodes").document(item["code"]).set(item)
+        # Small pause so a big one-off seed run doesn't hammer Firestore's
+        # write-rate limits; negligible for normal usage.
+        time.sleep(0.05)
         if i % 200 == 0:
             print(f"  {i}/{len(codes)} written ...")
     print("Firestore write complete.")
@@ -575,7 +578,7 @@ def seed_with_resumability(codes):
                     "_id":         item["code"],
                     "text":        build_embedding_text(item),
                     "description": item["description"][:1000],
-                    "category":    item.get("category") or "",
+                    "chapterTitle": item.get("chapterTitle") or "",
                     "heading":     item.get("heading") or "",
                     "chapter":     item.get("chapter") or 0,
                     "subCategory": " > ".join(item.get("classificationPath") or []),
@@ -588,7 +591,7 @@ def seed_with_resumability(codes):
 
         newly_seeded += len(batch)
         print(f"  upserted {newly_seeded}/{len(pending)} records ...")
-        time.sleep(0.1)
+        time.sleep(0.5)
 
     print("\nDone.")
     print(f"Newly upserted to Pinecone:   {newly_seeded}")
