@@ -35,6 +35,15 @@ def calculate_rate_amount(rate_obj, cif):
     return 0.0
 
 
+def _rate_display(rate_obj):
+    """The tariff's own printed rate, e.g. "15%", "Free", "LKR 5/kg" -- for
+    showing next to a calculated amount so the user sees what rate was used,
+    not just the resulting LKR figure."""
+    if not rate_obj or not isinstance(rate_obj, dict):
+        return None
+    return rate_obj.get("raw")
+
+
 def _percentage_amount(rate_obj, base):
     """VAT and SSCL are always ad valorem. If the cell parsed as anything other
     than a percentage (a mis-read flat value, "Ex", blank), contribute 0 rather
@@ -52,6 +61,21 @@ def _luxury_tax_amount(luxury_obj, cif):
     threshold = luxury_obj.get("freeThresholdAmount") or 0.0
     taxable_excess = max(0.0, cif - threshold)
     return calculate_rate_amount(luxury_obj.get("rateOnExcess"), taxable_excess)
+
+
+def _gen_or_sg_amount(rate_general, rate_sg, cif, origin_is_singapore):
+    """PAL and Cess each carry two national-duty columns in the tariff: a
+    general rate and an "SG" rate. Verified directly from the source PDFs'
+    own two-row header (both chapters checked): "SG" here is the same code
+    used for the Sri Lanka-Singapore FTA in the Preferential Duty block --
+    it is NOT a SAFTA/SAARC rate, despite that being a common assumption.
+    Use it only for a genuine Singapore origin, and only when the cell has a
+    real value (a blank means "no separate SG rate", not "free").
+
+    Returns (amount, rate_display)."""
+    if origin_is_singapore and rate_sg and rate_sg.get("raw") and rate_sg.get("type") != "unknown":
+        return calculate_rate_amount(rate_sg, cif), _rate_display(rate_sg)
+    return calculate_rate_amount(rate_general, cif), _rate_display(rate_general)
 
 
 # Shown to the user with every landed-cost result. The figure covers government
@@ -87,27 +111,57 @@ _SAARC_COUNTRIES = {
 }
 
 PREFERENTIAL_AGREEMENTS = {
-    "AP": {"name": "Asia-Pacific Trade Agreement (APTA)",
+    "AP": {"name": "Asia-Pacific Trade Agreement (APTA)", "short": "APTA",
            "countries": {"bangladesh", "china", "india", "south korea", "laos"}},
-    "AD": {"name": "APTA — Least Developed Countries",
+    "AD": {"name": "APTA — Least Developed Countries", "short": "APTA",
            "countries": {"bangladesh", "laos"}},
-    "BN": {"name": "Imports from Bangladesh",
+    "BN": {"name": "Imports from Bangladesh", "short": "APTA",
            "countries": {"bangladesh"}},
-    "GT": {"name": "Global System of Trade Preferences (GSTP)",
+    "GT": {"name": "Global System of Trade Preferences (GSTP)", "short": "GSTP",
            "countries": _GSTP_COUNTRIES},
-    "IN": {"name": "Indo-Sri Lanka FTA (ISFTA)",
+    "IN": {"name": "Indo-Sri Lanka FTA (ISFTA)", "short": "ISFTA",
            "countries": {"india"}},
-    "PK": {"name": "Pakistan-Sri Lanka FTA (PSFTA)",
+    "PK": {"name": "Pakistan-Sri Lanka FTA (PSFTA)", "short": "PSFTA",
            "countries": {"pakistan"}},
-    "SA": {"name": "SAARC countries (SAPTA)",
+    "SA": {"name": "SAARC countries (SAPTA)", "short": "SAPTA",
            "countries": _SAARC_COUNTRIES},
-    "SF": {"name": "South Asian Free Trade Area (SAFTA)",
+    "SF": {"name": "South Asian Free Trade Area (SAFTA)", "short": "SAFTA",
            "countries": _SAARC_COUNTRIES},
-    "SD": {"name": "SAFTA — Least Developed Countries",
+    "SD": {"name": "SAFTA — Least Developed Countries", "short": "SAFTA",
            "countries": {"bangladesh", "bhutan", "maldives", "nepal"}},
-    "SG": {"name": "Sri Lanka-Singapore FTA (SLSFTA)",
+    "SG": {"name": "Sri Lanka-Singapore FTA (SLSFTA)", "short": "SLSFTA",
            "countries": {"singapore"}},
 }
+
+# When a country qualifies under more than one agreement (e.g. India is in
+# both APTA and ISFTA), this is the order used to pick which one labels it in
+# the origin dropdown -- bilateral deals first, broad multilateral ones last.
+# This is purely a display label; _resolve_cid() below still checks every
+# agreement a country belongs to and always uses whichever rate is cheapest,
+# regardless of this label.
+_COUNTRY_LABEL_PRIORITY = ["IN", "PK", "SG", "BN", "AP", "SF", "SA", "AD", "SD", "GT"]
+
+
+def list_preferential_countries():
+    """One entry per country covered by any trade agreement, each with a
+    single display label, e.g. {"country": "India", "label": "India (ISFTA)"}.
+    Used to populate the origin-country dropdown."""
+    country_to_code = {}
+    for code in _COUNTRY_LABEL_PRIORITY:
+        for country in PREFERENTIAL_AGREEMENTS[code]["countries"]:
+            country_to_code.setdefault(country, code)
+
+    return sorted(
+        (
+            {
+                "country": country.title(),
+                "label": f"{country.title()} ({PREFERENTIAL_AGREEMENTS[code]['short']})",
+            }
+            for country, code in country_to_code.items()
+        ),
+        key=lambda c: c["country"],
+    )
+
 
 # Accept common spellings / short forms for the country of origin.
 _COUNTRY_ALIASES = {
@@ -133,23 +187,28 @@ def _normalize_country(origin):
 
 
 def _resolve_cid(data, cif, origin):
-    """Returns (cid_amount, basis) for the Customs Import Duty.
+    """Returns (cid_amount, basis, rate_display) for the Customs Import Duty.
 
     Starts from the general (Gen Duty) rate. If an origin country is given and it
     qualifies for a preferential agreement that has a real rate cell for this
     code (not a blank), and that rate works out cheaper, use it instead.
 
     basis is "general" or e.g. "preferential:IN (Indo-Sri Lanka FTA (ISFTA))".
+    rate_display is the tariff's own printed rate for whichever one won, e.g.
+    "15%" or "Free" -- straight from the "raw" field, for showing alongside
+    the calculated amount.
     """
-    general = calculate_rate_amount(data.get("cid_rate"), cif)
+    cid_rate = data.get("cid_rate")
+    general = calculate_rate_amount(cid_rate, cif)
     if not origin:
-        return general, "general"
+        return general, "general", _rate_display(cid_rate)
 
     country = _normalize_country(origin)
     preferential = data.get("preferential") or {}
 
     best_amount = general
     best_basis = "general"
+    best_display = _rate_display(cid_rate)
     for code, agreement in PREFERENTIAL_AGREEMENTS.items():
         if country not in agreement["countries"]:
             continue
@@ -162,8 +221,9 @@ def _resolve_cid(data, cif, origin):
         if amount < best_amount:
             best_amount = amount
             best_basis = f"preferential:{code} ({agreement['name']})"
+            best_display = _rate_display(rate)
 
-    return best_amount, best_basis
+    return best_amount, best_basis, best_display
 
 
 def calculate_landed_cost(data, cif, origin=None):
@@ -174,63 +234,68 @@ def calculate_landed_cost(data, cif, origin=None):
     agreement that gives this code a lower Customs Import Duty, that preferential
     rate is used instead of the general rate and `cidBasis` records which.
 
-    The normal stack, in the order the levies build on each other:
-        CID (Gen Duty / preferential)     on CIF
-        SCD (Surcharge on Customs Duty)    on CID          -- assumption, verify
-        PAL (Ports & Airports Levy)        on CIF
-        Cess                               on CIF
-        Excise (Special Provisions Duty)   on CIF + CID     -- assumption, verify
-        VAT                                on CIF + CID + SCD + PAL + Cess + Excise
-        SSCL (Social Security Levy)         same base as VAT -- simplified
-        Luxury Tax (Ch. 87)                on CIF above the free threshold
+    Layer order -- matches the seven-layer model importers are generally given
+    (CID -> PAL -> Cess -> Excise -> SCL -> SSCL -> VAT), plus two extra real
+    tariff columns this data actually has that aren't part of that simplified
+    explanation:
 
-    SCL (Special Commodity Levy), when it applies to a code, REPLACES the entire
-    stack above.
+        CID    (Gen Duty / preferential)          on CIF
+               -- replaced by SCL below for designated goods (fuel, rice,
+                  wheat, sugar, etc.), NOT by the whole stack
+        SCD    (Surcharge on Customs Duty)        on CID            -- extra column, not in the 7-layer model
+        PAL    (Ports & Airports Levy)             on CIF, Gen or SG rate*
+        Cess                                        on CIF, Gen or SG rate*
+        Excise (Special Provisions Duty)           on CIF + CID + SCD + PAL + Cess
+        SCL    (Special Commodity Levy)             on CIF -- REPLACES CID ONLY; every other layer still applies
+        SSCL   (Social Security Contribution Levy)  on CIF + CID + SCD + PAL + Cess + Excise + SCL
+        VAT                                          on CIF + CID + SCD + PAL + Cess + Excise + SCL + SSCL (everything above, cumulative)
+        Luxury Tax (Ch. 87 only)                    on CIF above a published free threshold -- extra, added on top, unaffected by the rest of the stack
+
+        * "SG" here is the Sri Lanka-Singapore FTA rate -- verified from the
+          source PDFs' own two-row column header (same code used for the
+          Singapore column in the Preferential Duty block). It is NOT a
+          SAFTA/SAARC rate, despite that being a common assumption.
 
     Every result is flagged `isEstimate: True` and carries `disclaimer` — the
     total is duties + taxes only, with no port/handling/agent/transport charges.
     """
-    scl_rate = data.get("scl_rate")
-    scl_amount = calculate_rate_amount(scl_rate, cif)
+    origin_is_singapore = bool(origin) and _normalize_country(origin) == "singapore"
 
-    # SCL, when present, REPLACES the normal duty stack entirely
-    if scl_rate and scl_rate.get("type") not in (None, "none"):
-        total_landed_cost = cif + scl_amount
-        return {
-            "declaredValue": round(cif, 2),
-            "cid": 0,
-            "cidBasis": "general",
-            "scd": 0,
-            "pal": 0,
-            "cess": 0,
-            "excise": 0,
-            "vat": 0,
-            "sscl": 0,
-            "luxuryTax": 0,
-            "scl": round(scl_amount, 2),
-            "totalLandedCost": round(total_landed_cost, 2),
-            "isEstimate": True,
-            "disclaimer": ESTIMATE_DISCLAIMER,
-            "note": "SCL applies to this code, replacing the standard duty stack",
-        }
+    cid, cid_basis, cid_rate_display = _resolve_cid(data, cif, origin)
+    scd_rate = data.get("scd_rate")
+    scd = calculate_rate_amount(scd_rate, cid)  # surcharge ON the customs duty
 
-    # Normal duty stack — no SCL override
-    cid, cid_basis = _resolve_cid(data, cif, origin)
-    scd    = calculate_rate_amount(data.get("scd_rate"), cid)          # surcharge ON the customs duty
-    pal    = calculate_rate_amount(data.get("pal_gen_rate"), cif)
-    cess   = calculate_rate_amount(data.get("cess_gen_rate"), cif)
-    excise = calculate_rate_amount(data.get("excise_rate"), cif + cid)
-
-    # VAT and SSCL are charged on the accumulated value plus every preceding levy
-    levy_base = cif + cid + scd + pal + cess + excise
-    vat  = _percentage_amount(data.get("vat_rate"), levy_base)
-    sscl = _percentage_amount(data.get("sscl_rate"), levy_base)
-
-    luxury_tax = _luxury_tax_amount(data.get("luxuryTax"), cif)
-
-    total_landed_cost = (
-        cif + cid + scd + pal + cess + excise + vat + sscl + luxury_tax
+    pal, pal_rate_display = _gen_or_sg_amount(
+        data.get("pal_gen_rate"), data.get("pal_sg_rate"), cif, origin_is_singapore
     )
+    cess, cess_rate_display = _gen_or_sg_amount(
+        data.get("cess_gen_rate"), data.get("cess_sg_rate"), cif, origin_is_singapore
+    )
+
+    excise_rate = data.get("excise_rate")
+    excise = calculate_rate_amount(excise_rate, cif + cid + scd + pal + cess)
+
+    # SCL (fixed/flat, or ad valorem for some commodities) replaces CID only
+    # for the designated goods that carry it -- every other layer above and
+    # below still applies normally.
+    scl_rate = data.get("scl_rate")
+    scl = calculate_rate_amount(scl_rate, cif)
+    if scl_rate and scl_rate.get("type") not in (None, "none"):
+        cid = 0.0
+        cid_basis = "replaced_by_scl"
+
+    sscl_rate = data.get("sscl_rate")
+    sscl_base = cif + cid + scd + pal + cess + excise + scl
+    sscl = _percentage_amount(sscl_rate, sscl_base)
+
+    vat_rate = data.get("vat_rate")
+    vat_base = sscl_base + sscl
+    vat = _percentage_amount(vat_rate, vat_base)
+
+    luxury_obj = data.get("luxuryTax")
+    luxury_tax = _luxury_tax_amount(luxury_obj, cif)
+
+    total_landed_cost = cif + cid + scd + pal + cess + excise + scl + sscl + vat + luxury_tax
 
     return {
         "declaredValue": round(cif, 2),
@@ -240,10 +305,23 @@ def calculate_landed_cost(data, cif, origin=None):
         "pal": round(pal, 2),
         "cess": round(cess, 2),
         "excise": round(excise, 2),
-        "vat": round(vat, 2),
+        "scl": round(scl, 2),
         "sscl": round(sscl, 2),
+        "vat": round(vat, 2),
         "luxuryTax": round(luxury_tax, 2),
-        "scl": 0,
+        # The tariff's own printed rate for whichever figure was actually
+        # used (e.g. "15%", "Free") -- shown next to each amount in the UI.
+        "rates": {
+            "cid": cid_rate_display,
+            "scd": _rate_display(scd_rate),
+            "pal": pal_rate_display,
+            "cess": cess_rate_display,
+            "excise": _rate_display(excise_rate),
+            "scl": _rate_display(scl_rate),
+            "sscl": _rate_display(sscl_rate),
+            "vat": _rate_display(vat_rate),
+            "luxuryTax": _rate_display((luxury_obj or {}).get("rateOnExcess")),
+        },
         "totalLandedCost": round(total_landed_cost, 2),
         "isEstimate": True,
         "disclaimer": ESTIMATE_DISCLAIMER,

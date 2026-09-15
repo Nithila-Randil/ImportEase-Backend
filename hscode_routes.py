@@ -1,3 +1,6 @@
+import time
+
+import requests
 from fastapi import APIRouter, HTTPException, Query
 from typing import Optional
 from dotenv import load_dotenv
@@ -5,7 +8,7 @@ import os
 from pinecone import Pinecone
 
 from firebase_setup import db
-from duty_calculator import calculate_landed_cost
+from duty_calculator import calculate_landed_cost, list_preferential_countries
 
 router = APIRouter()
 
@@ -79,6 +82,18 @@ def search_hscodes(q: str = Query(..., description="Plain-language product descr
     return results
 
 
+# NOTE: FastAPI matches routes in declaration order, and /hscodes/{code} is a
+# single-segment wildcard -- any other single-segment /hscodes/<literal>
+# route (like this one) MUST be declared above it, or {code} will swallow it.
+@router.get("/hscodes/preferential-countries")
+def get_preferential_countries():
+    """Countries covered by any Sri Lanka trade agreement, one label each --
+    powers the origin-country dropdown. Built from duty_calculator.py's own
+    PREFERENTIAL_AGREEMENTS data so the list can never drift out of sync with
+    what /hscodes/{code}/landed-cost actually checks."""
+    return list_preferential_countries()
+
+
 @router.get("/hscodes/{code}")
 def get_hscode_detail(code: str):
     doc = db.collection("hscodes").document(code).get()
@@ -87,12 +102,61 @@ def get_hscode_detail(code: str):
 
     data = doc.to_dict()
     return {
-        "code":         data.get("code"),
-        "description":  data.get("description"),
-        "chapterTitle": data.get("chapterTitle"),
-        "chapter":      data.get("chapter"),
-        "unit":         data.get("unit"),
+        "code":               data.get("code"),
+        "description":        data.get("description"),
+        "headingDescription": data.get("headingDescription"),
+        "classificationPath": data.get("classificationPath"),
+        "chapterTitle":       data.get("chapterTitle"),
+        "chapter":            data.get("chapter"),
+        "unit":               data.get("unit"),
+        # Import Control License / Sri Lanka Standards Institution marking.
+        # Blank means no special control on this code. When present (e.g.
+        # "L", "S", "LS", "B") it means SOME kind of import license and/or
+        # SLSI certification requirement applies -- we don't have a verified
+        # legend for exactly what each letter means, so the frontend shows
+        # the raw code with a "verify with Customs" caution rather than
+        # guessing at a precise meaning.
+        "iclSlsi":            data.get("iclSlsi"),
     }
+
+
+# Exchange rate -- refreshed at most once every 30 minutes, so a page full of
+# calculator visitors doesn't hammer the free external API on every request.
+_exchange_rate_cache = {"rate": None, "fetchedAt": 0, "asOf": None}
+_EXCHANGE_RATE_TTL_SECONDS = 30 * 60
+
+
+@router.get("/exchange-rate")
+def get_usd_to_lkr_rate():
+    """Live USD -> LKR rate, used to convert a CIF value entered in USD into
+    the LKR figure Sri Lanka Customs duties are actually assessed on."""
+    now = time.time()
+    if _exchange_rate_cache["rate"] and now - _exchange_rate_cache["fetchedAt"] < _EXCHANGE_RATE_TTL_SECONDS:
+        return {
+            "rate": _exchange_rate_cache["rate"],
+            "asOf": _exchange_rate_cache["asOf"],
+            "cached": True,
+        }
+
+    try:
+        response = requests.get("https://open.er-api.com/v6/latest/USD", timeout=8)
+        response.raise_for_status()
+        data = response.json()
+        rate = data["rates"]["LKR"]
+        as_of = data.get("time_last_update_utc")
+    except Exception:
+        if _exchange_rate_cache["rate"]:
+            # Serve the last known rate rather than failing outright.
+            return {
+                "rate": _exchange_rate_cache["rate"],
+                "asOf": _exchange_rate_cache["asOf"],
+                "cached": True,
+                "stale": True,
+            }
+        raise HTTPException(status_code=503, detail="Could not fetch the exchange rate right now")
+
+    _exchange_rate_cache.update(rate=rate, fetchedAt=now, asOf=as_of)
+    return {"rate": rate, "asOf": as_of, "cached": False}
 
 
 @router.get("/hscodes/{code}/landed-cost")
