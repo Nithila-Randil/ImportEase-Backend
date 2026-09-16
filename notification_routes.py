@@ -25,14 +25,22 @@ router = APIRouter()
 NOTIFICATIONS_COLLECTION = "notifications"
 
 
-def create_notification(user_id: str, shipment_id: str, message: str):
-    """Call this from other route files to create a notification for a user."""
+def create_notification(user_id: str, shipment_id: str, message: str,
+                         notif_type: str = "general", tender_id: str = None):
+    """Call this from other route files to create a notification for a user.
+
+    `notif_type` + `tenderId` let each role's Notifications page send the
+    click on a notification to the right screen (e.g. a "new_bid" notification
+    takes an importer straight to that tender) without the frontend having to
+    parse the human-readable `message`."""
     if not user_id:
         return None
     doc_ref = db.collection(NOTIFICATIONS_COLLECTION).document()
     data = {
         "userId": user_id,
         "shipmentId": shipment_id,
+        "tenderId": tender_id,
+        "type": notif_type,
         "message": message,
         "read": False,
         "createdAt": datetime.now(timezone.utc).isoformat(),

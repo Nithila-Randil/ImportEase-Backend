@@ -97,6 +97,24 @@ def register_agency(data: AgencyRegisterRequest):
     }
 
 
+@router.get("/agencies")
+def list_agencies(user: dict = Depends(verify_token)):
+    """Public directory of active agencies/independent agents -- powers the
+    SME's "browse agents" screen for sending a direct request. Only safe,
+    public-facing fields are returned; license/contact details stay private."""
+    query = db.collection("agencies").where("profileStatus", "==", "active")
+    agencies = []
+    for doc in query.stream():
+        data = doc.to_dict()
+        agencies.append({
+            "id": doc.id,
+            "companyName": data.get("companyName"),
+            "isIndependent": data.get("isIndependent", False),
+            "businessAddress": data.get("businessAddress"),
+        })
+    return agencies
+
+
 @router.get("/agencies/{id}")
 def get_agency(id: str, user: dict = Depends(verify_token)):
     doc = db.collection("agencies").document(id).get()
