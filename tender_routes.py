@@ -308,6 +308,13 @@ def _check_agent_can_bid(user: dict):
     if user_data.get("isAgencyAdmin") and not agency_data.get("isIndependent", False):
         raise HTTPException(status_code=403, detail="Agency admins cannot place bids")
 
+    # A real agency's member agent needs a platform admin's sign-off too --
+    # a second, independent gate on top of their own agency admin's approval
+    # (agentStatus above). Independent agents skip this: their agentStatus
+    # IS the platform gate, approved directly by a platform admin.
+    if not agency_data.get("isIndependent", False) and user_data.get("platformStatus") != "approved":
+        raise HTTPException(status_code=403, detail="Agent is pending ImportEase platform review")
+
     return user_data, agency_data
 
 

@@ -128,7 +128,8 @@ def register(data: RegisterRequest):
     user_data = {
         "name": data.name,
         "email": data.email,
-        "role": data.role
+        "role": data.role,
+        "createdAt": datetime.now(timezone.utc).isoformat(),
     }
 
     if data.role == "importer":
@@ -155,6 +156,12 @@ def register(data: RegisterRequest):
             user_data["experience"] = data.experience
             user_data["agentId"] = data.agentId
             user_data["address"] = data.address
+        else:
+            # Joined a real agency. agentStatus above is their own agency
+            # admin's gate; this is a SECOND, independent gate -- a platform
+            # admin must also sign off before this agent can bid, same as
+            # any other clearing agent on the platform.
+            user_data["platformStatus"] = "pending"
 
     db.collection("users").document(user_record.uid).set(user_data)
 

@@ -133,6 +133,7 @@ def get_agent_profile(agent_id: str, user: dict = Depends(verify_token)):
     return {
         "id": agent_id,
         "name": data.get("name"),
+        "experience": data.get("experience"),
         "agencyName": agency_data.get("companyName"),
         "isIndependent": agency_data.get("isIndependent", False),
         "businessAddress": agency_data.get("businessAddress"),
