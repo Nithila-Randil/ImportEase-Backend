@@ -105,22 +105,32 @@ def create_tender(
     if len(existing_open) > 0:
         raise HTTPException(status_code=400, detail="This shipment already has an open tender")
 
+    # One open request per HS code -- and, since an SME can also post without
+    # picking one, one open "no HS code" request too. Without this second
+    # branch a no-HS-code shipment skipped the check entirely, letting the
+    # same request go to the open board AND to any number of specific
+    # agents at once with nothing to stop it.
     hs_code_check = shipment_data.get("hsCode")
-    if hs_code_check:
-        duplicate_hs_code = (
-            db.collection(TENDERS_COLLECTION)
-            .where("importerId", "==", user["uid"])
-            .where("hsCode", "==", hs_code_check)
-            .where("status", "==", "open")
-            .limit(1)
-            .get()
-        )
-        if len(duplicate_hs_code) > 0:
+    duplicate_request = (
+        db.collection(TENDERS_COLLECTION)
+        .where("importerId", "==", user["uid"])
+        .where("hsCode", "==", hs_code_check)
+        .where("status", "==", "open")
+        .limit(1)
+        .get()
+    )
+    if len(duplicate_request) > 0:
+        if hs_code_check:
             raise HTTPException(
                 status_code=400,
                 detail=f"You already have an open request for HS code {hs_code_check}. "
                        "Withdraw it or wait for it to close before posting another.",
             )
+        raise HTTPException(
+            status_code=400,
+            detail="You already have an open request without an HS code. "
+                   "Withdraw it or wait for it to close before posting another.",
+        )
 
     target_agency_id = payload.targetAgencyId if payload else None
     target_agency_doc = None
@@ -332,7 +342,7 @@ def submit_bid(tender_id: str, bid: BidCreate, user: dict = Depends(verify_token
         user_id=tender_data.get("importerId"),
         shipment_id=tender_data.get("shipmentId"),
         message=(
-            f"New {'pitch' if tender_data.get('targetAgencyId') else 'bid'} from "
+            f"New bid from "
             f"{agent_data.get('name') or 'a clearing agent'} "
             f"({agency_data.get('companyName') or 'agency'}) -- Rs. {bid.feeLkr:,.0f}"
         ),
@@ -439,6 +449,13 @@ def accept_bid(tender_id: str, bid_id: str, user: dict = Depends(verify_token)):
     shipment_ref = db.collection(SHIPMENTS_COLLECTION).document(tender_data["shipmentId"])
     shipment_ref.update({
         "agentId": bid_data.get("agentId"),
+        # Denormalized from the winning bid so the SME's shipment tracker can
+        # show who's handling it, and the agreed price/timeline, with no
+        # extra lookup.
+        "agentName": bid_data.get("agentName"),
+        "agencyName": bid_data.get("agencyName"),
+        "feeLkr": bid_data.get("feeLkr"),
+        "clearanceTimelineHours": bid_data.get("clearanceTimelineHours"),
         "currentStage": "assigned",
     })
 
@@ -447,6 +464,52 @@ def accept_bid(tender_id: str, bid_id: str, user: dict = Depends(verify_token)):
         shipment_id=tender_data["shipmentId"],
         message=f"Your bid was accepted! You're now assigned to shipment {tender_data['shipmentId']}.",
         notif_type="bid_accepted",
+        tender_id=tender_id,
+    )
+
+    return {"id": bid_id, **bid_ref.get().to_dict()}
+
+
+@router.post("/tenders/{tender_id}/bids/{bid_id}/reject")
+def reject_bid(tender_id: str, bid_id: str, user: dict = Depends(verify_token)):
+    """Importer rejects a bid on a direct request (one sent to one specific
+    agency, not the open marketplace board). On the open board there's
+    nothing to reject standalone -- accepting a different bid already
+    rejects the rest -- so this only applies where targetAgencyId is set,
+    since a direct request only ever gets the one bid from that agency.
+    Rejecting closes the tender (there's no other bidder coming), which also
+    frees the SME from the duplicate-open-request guard so they can post a
+    fresh request -- open board or to a different agent -- right away."""
+    tender_ref, tender_doc = _get_or_404(TENDERS_COLLECTION, tender_id, "Tender not found")
+    tender_data = tender_doc.to_dict()
+
+    if tender_data.get("importerId") != user["uid"]:
+        raise HTTPException(status_code=403, detail="Only the owning importer can reject a bid")
+
+    if not tender_data.get("targetAgencyId"):
+        raise HTTPException(
+            status_code=400,
+            detail="Bids on the open marketplace board can't be rejected directly -- "
+                   "accept a different bid to reject the rest.",
+        )
+
+    if tender_data.get("status") != "open":
+        raise HTTPException(status_code=400, detail="This tender is already closed")
+
+    bid_ref, bid_doc = _get_bid_or_404(tender_id, bid_id)
+    bid_data = bid_doc.to_dict()
+
+    if bid_data.get("status") != "pending":
+        raise HTTPException(status_code=400, detail="This bid is no longer pending")
+
+    bid_ref.update({"status": "rejected"})
+    tender_ref.update({"status": "closed"})
+
+    create_notification(
+        user_id=bid_data.get("agentId"),
+        shipment_id=tender_data.get("shipmentId"),
+        message="Your bid was not selected for this shipment.",
+        notif_type="bid_rejected",
         tender_id=tender_id,
     )
 

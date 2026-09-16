@@ -97,6 +97,9 @@ def create_shipment(shipment: ShipmentCreate, user: dict = Depends(require_role(
         "contactPhone": shipment.contactPhone,
         "contactEmail": shipment.contactEmail,
         "importerId": user["uid"],
+        # Denormalized so the assigned agent's Shipments page can show who
+        # they're working for without a per-card importer lookup.
+        "importerName": user["profile"].get("name"),
         "agentId": None,
         "currentStage": STAGE_ORDER[0],
         "reference": f"IE-{doc_ref.id[:8].upper()}",
