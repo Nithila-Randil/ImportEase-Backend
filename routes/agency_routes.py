@@ -7,7 +7,7 @@ from pydantic import BaseModel
 
 from firebase_setup import db
 from dependencies import verify_token
-from auth_routes import generate_agency_code, find_agency_by_code
+from routes.auth_routes import generate_agency_code, find_agency_by_code
 
 router = APIRouter()
 
