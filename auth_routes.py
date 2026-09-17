@@ -18,7 +18,17 @@ class RegisterRequest(BaseModel):
     email: str
     password: str
     role: str  # "importer" or "clearing_agent"
-    agencyCode: Optional[str] = None  # required if role is clearing_agent
+    agencyCode: Optional[str] = None  # if role is clearing_agent: join this agency
+
+    # Independent clearing-agent professional details. Only read when role is
+    # clearing_agent and no agencyCode is given (i.e. the agent is registering
+    # as an independent, who then goes through platform review).
+    phone: Optional[str] = None
+    licenseNumber: Optional[str] = None
+    licenseExpiry: Optional[str] = None
+    experience: Optional[str] = None
+    agentId: Optional[str] = None
+    address: Optional[str] = None
 
 
 class ProfileUpdateRequest(BaseModel):
@@ -78,11 +88,18 @@ def register(data: RegisterRequest):
             is_agency_admin = True
 
     # 1. Create the user in Firebase Authentication
-    user_record = auth.create_user(
-        email=data.email,
-        password=data.password,
-        display_name=data.name
-    )
+    try:
+        user_record = auth.create_user(
+            email=data.email,
+            password=data.password,
+            display_name=data.name
+        )
+    except auth.EmailAlreadyExistsError:
+        raise HTTPException(status_code=400, detail="An account with that email already exists")
+    except ValueError as exc:
+        # firebase-admin raises ValueError for a malformed email or a password
+        # shorter than 6 characters.
+        raise HTTPException(status_code=400, detail=str(exc))
 
     # 1b. If independent, auto-create a solo agency
     if data.role == "clearing_agent" and is_agency_admin:
@@ -111,7 +128,8 @@ def register(data: RegisterRequest):
     user_data = {
         "name": data.name,
         "email": data.email,
-        "role": data.role
+        "role": data.role,
+        "createdAt": datetime.now(timezone.utc).isoformat(),
     }
 
     if data.role == "importer":
@@ -120,9 +138,30 @@ def register(data: RegisterRequest):
     if data.role == "clearing_agent":
         user_data["agencyId"] = agency_id
         user_data["isAgencyAdmin"] = is_agency_admin
-        user_data["agentStatus"] = "approved" if is_agency_admin else "pending"
-        user_data["profileComplete"] = False
-        user_data["phone"] = None
+        # An agent who registered without an agency code got a solo agency
+        # auto-created above (isIndependent). One who joined with a code did not.
+        user_data["isIndependent"] = is_agency_admin
+        # Nobody is auto-approved:
+        #   - joined an agency  -> that agency's admin approves them
+        #   - independent       -> an ImportEase platform admin approves them
+        user_data["agentStatus"] = "pending"
+        user_data["profileComplete"] = bool(data.phone)
+        user_data["phone"] = data.phone
+
+        if is_agency_admin:
+            # Independent agent -- keep the professional details they submitted
+            # so a platform admin can review the application.
+            user_data["licenseNumber"] = data.licenseNumber
+            user_data["licenseExpiry"] = data.licenseExpiry
+            user_data["experience"] = data.experience
+            user_data["agentId"] = data.agentId
+            user_data["address"] = data.address
+        else:
+            # Joined a real agency. agentStatus above is their own agency
+            # admin's gate; this is a SECOND, independent gate -- a platform
+            # admin must also sign off before this agent can bid, same as
+            # any other clearing agent on the platform.
+            user_data["platformStatus"] = "pending"
 
     db.collection("users").document(user_record.uid).set(user_data)
 

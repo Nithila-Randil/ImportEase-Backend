@@ -14,6 +14,8 @@ from tender_routes import router as tender_router
 from document_routes import router as document_router
 from notification_routes import router as notification_router
 from agent_rating_routes import router as agent_rating_router
+from admin_routes import router as admin_router
+from agent_verification_routes import router as agent_verification_router
 
 load_dotenv()
 
@@ -45,6 +47,8 @@ app.include_router(tender_router)
 app.include_router(document_router)
 app.include_router(notification_router)
 app.include_router(agent_rating_router)
+app.include_router(admin_router)
+app.include_router(agent_verification_router)
 
 
 @app.get("/")

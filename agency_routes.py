@@ -37,11 +37,16 @@ class AgentApprovalRequest(BaseModel):
 # ============================================================
 @router.post("/agencies/register")
 def register_agency(data: AgencyRegisterRequest):
-    user_record = auth.create_user(
-        email=data.email,
-        password=data.password,
-        display_name=data.companyName
-    )
+    try:
+        user_record = auth.create_user(
+            email=data.email,
+            password=data.password,
+            display_name=data.companyName
+        )
+    except auth.EmailAlreadyExistsError:
+        raise HTTPException(status_code=400, detail="An account with that email already exists")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
     agency_code = generate_agency_code()
     while find_agency_by_code(agency_code)[0] is not None:
@@ -70,7 +75,12 @@ def register_agency(data: AgencyRegisterRequest):
         "role": "clearing_agent",
         "agencyId": agency_id,
         "isAgencyAdmin": True,
-        "agentStatus": "approved",
+        "isIndependent": False,
+        # Not auto-approved -- a real agency's admin only gets dashboard
+        # access once an ImportEase platform admin approves the agency
+        # itself (see admin_routes.decide_agency, which flips this to
+        # "approved"/"rejected" alongside the agency's profileStatus).
+        "agentStatus": "pending",
         "profileComplete": False,
         "phone": None
     }
@@ -89,6 +99,46 @@ def register_agency(data: AgencyRegisterRequest):
             **user_data
         }
     }
+
+
+@router.get("/agencies/by-code/{code}")
+def get_agency_by_code(code: str):
+    """Public, no-auth lookup used by the 'Join an Existing Agency' signup
+    flow to validate a code before the applicant fills in the rest of the
+    form -- they have no account/token yet at that point."""
+    agency_id, agency_data = find_agency_by_code(code.strip().upper())
+    if not agency_id:
+        raise HTTPException(status_code=404, detail="Invalid agency code")
+    return {"id": agency_id, "companyName": agency_data.get("companyName")}
+
+
+@router.get("/agencies")
+def list_agencies(user: dict = Depends(verify_token)):
+    """Public directory of active independent agents -- powers the SME's
+    "browse agents" screen for sending a direct request. Real (multi-agent)
+    agencies are excluded: a real agency's admin can't place bids (see
+    _check_agent_can_bid in tender_routes.py), so targeting the agency
+    itself has no single agent who could actually accept the request --
+    only individual agents can. Only safe, public-facing fields are
+    returned; license/contact details stay private."""
+    query = (
+        db.collection("agencies")
+        .where("profileStatus", "==", "active")
+        .where("isIndependent", "==", True)
+    )
+    agencies = []
+    for doc in query.stream():
+        data = doc.to_dict()
+        agencies.append({
+            "id": doc.id,
+            "companyName": data.get("companyName"),
+            "isIndependent": True,
+            "businessAddress": data.get("businessAddress"),
+            # Lets the SME's "View Profile" popup resolve to this one
+            # agent's public-safe profile via GET /agents/{adminUid}/profile.
+            "adminUid": data.get("adminUid"),
+        })
+    return agencies
 
 
 @router.get("/agencies/{id}")
@@ -134,7 +184,12 @@ def complete_agency_profile(id: str, data: AgencyProfileRequest, user: dict = De
         "licenseNumber": data.licenseNumber,
         "businessAddress": data.businessAddress,
         "businessPhone": data.businessPhone,
-        "profileStatus": "active"
+        # Completing the profile no longer activates the agency by itself --
+        # it now waits on a platform admin's review (see admin_routes.py).
+        # For an independent agent's own solo agency, that review happens as
+        # part of approving the agent themselves (/admin/agents/{id}/approve),
+        # which flips this to "active" on approval.
+        "profileStatus": "pending"
     }
 
     if not is_independent:
@@ -147,6 +202,29 @@ def complete_agency_profile(id: str, data: AgencyProfileRequest, user: dict = De
         "id": id,
         **updated_doc.to_dict()
     }
+
+
+@router.get("/agencies/{id}/agents")
+def list_all_agency_agents(id: str, user: dict = Depends(verify_token)):
+    """Every member agent (any agentStatus) belonging to this agency --
+    powers the agency admin's full roster view (pending + active), not just
+    the pending queue. Excludes the admin's own account."""
+    agency_doc = db.collection("agencies").document(id).get()
+    if not agency_doc.exists:
+        raise HTTPException(status_code=404, detail="Agency not found")
+
+    agency_data = agency_doc.to_dict()
+    if agency_data.get("adminUid") != user["uid"]:
+        raise HTTPException(status_code=403, detail="Only the agency admin can view agents")
+
+    query = (
+        db.collection("users")
+        .where("agencyId", "==", id)
+        .where("isAgencyAdmin", "==", False)
+        .get()
+    )
+
+    return [{"id": doc.id, **doc.to_dict()} for doc in query]
 
 
 @router.get("/agencies/{id}/pending-agents")
@@ -186,6 +264,15 @@ def approve_agent(id: str, agentId: str, data: AgentApprovalRequest, user: dict 
 
     if not agent_doc.exists or agent_doc.to_dict().get("agencyId") != id:
         raise HTTPException(status_code=404, detail="Agent not found in this agency")
+
+    # ImportEase reviews first -- the agency admin's own approval only
+    # becomes available once a platform admin has already signed off on
+    # this agent via /admin/agency-agents/{id}/approve.
+    if agent_doc.to_dict().get("platformStatus") != "approved":
+        raise HTTPException(
+            status_code=400,
+            detail="This agent is still awaiting ImportEase platform review before you can approve them.",
+        )
 
     agent_ref.update({"agentStatus": data.decision})
 

@@ -33,6 +33,8 @@ router = APIRouter()
 
 RATINGS_COLLECTION = "ratings"
 SHIPMENTS_COLLECTION = "shipments"
+USERS_COLLECTION = "users"
+AGENCIES_COLLECTION = "agencies"
 
 
 class RatingCreate(BaseModel):
@@ -105,4 +107,36 @@ def get_agent_ratings(agent_id: str, user: dict = Depends(verify_token)):
         "averageRating": average_rating,
         "completedJobs": completed_jobs,
         "averageClearanceTimeHours": None,  # not tracked yet -- see file docstring
+    }
+
+
+@router.get("/agents/{agent_id}/profile")
+def get_agent_profile(agent_id: str, user: dict = Depends(verify_token)):
+    """Public-safe profile for a clearing agent -- powers the small "view
+    profile" popup an SME can open from a bid. Deliberately excludes
+    email/phone, same rule as tenders: contact details only become visible
+    once an agent is actually assigned to a shipment."""
+    doc = db.collection(USERS_COLLECTION).document(agent_id).get()
+    if not doc.exists or doc.to_dict().get("role") != "clearing_agent":
+        raise HTTPException(status_code=404, detail="Agent not found")
+    data = doc.to_dict()
+
+    agency_data = {}
+    agency_id = data.get("agencyId")
+    if agency_id:
+        agency_doc = db.collection(AGENCIES_COLLECTION).document(agency_id).get()
+        if agency_doc.exists:
+            agency_data = agency_doc.to_dict()
+
+    ratings = get_agent_ratings(agent_id, user)
+
+    return {
+        "id": agent_id,
+        "name": data.get("name"),
+        "experience": data.get("experience"),
+        "agencyName": agency_data.get("companyName"),
+        "isIndependent": agency_data.get("isIndependent", False),
+        "businessAddress": agency_data.get("businessAddress"),
+        "licenseNumber": agency_data.get("licenseNumber"),
+        **ratings,
     }

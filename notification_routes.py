@@ -25,14 +25,22 @@ router = APIRouter()
 NOTIFICATIONS_COLLECTION = "notifications"
 
 
-def create_notification(user_id: str, shipment_id: str, message: str):
-    """Call this from other route files to create a notification for a user."""
+def create_notification(user_id: str, shipment_id: str, message: str,
+                         notif_type: str = "general", tender_id: str = None):
+    """Call this from other route files to create a notification for a user.
+
+    `notif_type` + `tenderId` let each role's Notifications page send the
+    click on a notification to the right screen (e.g. a "new_bid" notification
+    takes an importer straight to that tender) without the frontend having to
+    parse the human-readable `message`."""
     if not user_id:
         return None
     doc_ref = db.collection(NOTIFICATIONS_COLLECTION).document()
     data = {
         "userId": user_id,
         "shipmentId": shipment_id,
+        "tenderId": tender_id,
+        "type": notif_type,
         "message": message,
         "read": False,
         "createdAt": datetime.now(timezone.utc).isoformat(),
@@ -63,3 +71,15 @@ def mark_as_read(notification_id: str, user: dict = Depends(verify_token)):
     doc_ref.update({"read": True})
     updated = doc_ref.get().to_dict()
     return {"id": notification_id, **updated}
+
+
+@router.delete("/notifications")
+def clear_notifications(user: dict = Depends(verify_token)):
+    """Deletes every notification belonging to the calling user -- the
+    "Clear all" button on each role's Notifications page."""
+    query = db.collection(NOTIFICATIONS_COLLECTION).where("userId", "==", user["uid"])
+    count = 0
+    for doc in query.stream():
+        doc.reference.delete()
+        count += 1
+    return {"detail": "Notifications cleared", "count": count}

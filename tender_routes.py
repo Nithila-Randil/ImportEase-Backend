@@ -47,6 +47,13 @@ class BidCreate(BaseModel):
     notes: Optional[str] = None
 
 
+class TenderCreate(BaseModel):
+    # When set, this tender is a direct request aimed at one agency (or one
+    # independent agent -- their "agency" IS just themselves) instead of the
+    # open board. Only agents at that agency see it in GET /tenders.
+    targetAgencyId: Optional[str] = None
+
+
 # ---------- Helpers ----------
 
 def _get_or_404(collection: str, doc_id: str, not_found_msg: str):
@@ -71,8 +78,14 @@ def _get_required_permits(hs_code: str):
 # ---------- Tenders ----------
 
 @router.post("/shipments/{shipment_id}/tender")
-def create_tender(shipment_id: str, user: dict = Depends(require_role("importer"))):
-    """Importer posts their (draft) shipment to the Clearing Agent Board."""
+def create_tender(
+    shipment_id: str,
+    payload: Optional[TenderCreate] = None,
+    user: dict = Depends(require_role("importer")),
+):
+    """Importer posts their (draft) shipment to the Clearing Agent Board, or
+    -- when payload.targetAgencyId is set -- sends it as a direct request to
+    one specific agency/independent agent instead."""
     shipment_ref, shipment_doc = _get_or_404(SHIPMENTS_COLLECTION, shipment_id, "Shipment not found")
     shipment_data = shipment_doc.to_dict()
 
@@ -92,6 +105,40 @@ def create_tender(shipment_id: str, user: dict = Depends(require_role("importer"
     if len(existing_open) > 0:
         raise HTTPException(status_code=400, detail="This shipment already has an open tender")
 
+    # One open request per HS code -- and, since an SME can also post without
+    # picking one, one open "no HS code" request too. Without this second
+    # branch a no-HS-code shipment skipped the check entirely, letting the
+    # same request go to the open board AND to any number of specific
+    # agents at once with nothing to stop it.
+    hs_code_check = shipment_data.get("hsCode")
+    duplicate_request = (
+        db.collection(TENDERS_COLLECTION)
+        .where("importerId", "==", user["uid"])
+        .where("hsCode", "==", hs_code_check)
+        .where("status", "==", "open")
+        .limit(1)
+        .get()
+    )
+    if len(duplicate_request) > 0:
+        if hs_code_check:
+            raise HTTPException(
+                status_code=400,
+                detail=f"You already have an open request for HS code {hs_code_check}. "
+                       "Withdraw it or wait for it to close before posting another.",
+            )
+        raise HTTPException(
+            status_code=400,
+            detail="You already have an open request without an HS code. "
+                   "Withdraw it or wait for it to close before posting another.",
+        )
+
+    target_agency_id = payload.targetAgencyId if payload else None
+    target_agency_doc = None
+    if target_agency_id:
+        target_agency_doc = db.collection(AGENCIES_COLLECTION).document(target_agency_id).get()
+        if not target_agency_doc.exists or target_agency_doc.to_dict().get("profileStatus") != "active":
+            raise HTTPException(status_code=400, detail="Selected agent is not available for direct requests")
+
     hs_code = shipment_data.get("hsCode")
     tender_ref = db.collection(TENDERS_COLLECTION).document()
     tender_data = {
@@ -101,22 +148,74 @@ def create_tender(shipment_id: str, user: dict = Depends(require_role("importer"
         "hsCode": hs_code,
         "volume": None,  # not tracked on Shipment yet
         "requiredPermits": _get_required_permits(hs_code),
+        # Copied from the shipment so agents browsing the open board can see
+        # enough to decide whether to bid without needing shipment access --
+        # GET /shipments/{id} is restricted to the owning importer/assigned
+        # agent, and nobody is assigned yet at tender time.
+        "description": shipment_data.get("description"),
+        "declaredValue": shipment_data.get("declaredValue"),
+        "origin": shipment_data.get("origin"),
+        "estimatedArrival": shipment_data.get("estimatedArrival"),
+        "mustReleaseBy": shipment_data.get("mustReleaseBy"),
+        # Deliberately NOT copied: contactPhone/contactEmail. Those stay on the
+        # Shipment doc, only visible via GET /shipments/{id} once an agent is
+        # actually assigned -- no reason to expose an importer's contact
+        # details to every agent browsing the open board.
+        "targetAgencyId": target_agency_id,
+        # Denormalized at post time so the SME's "your requests" list can
+        # label a direct request without a per-card agency lookup.
+        "targetAgencyName": target_agency_doc.to_dict().get("companyName") if target_agency_doc else None,
         "status": "open",
         "postedAt": datetime.now(timezone.utc).isoformat(),
     }
     tender_ref.set(tender_data)
 
+    if target_agency_id:
+        importer_doc = db.collection(USERS_COLLECTION).document(user["uid"]).get()
+        importer_name = importer_doc.to_dict().get("name") if importer_doc.exists else None
+        # Notifying just the agency admin -- there's no per-agent inbox routing
+        # within an agency yet, so the admin is the point of contact for a
+        # direct request the same way they're the one who completes the
+        # agency's profile and manages its members.
+        create_notification(
+            user_id=target_agency_doc.to_dict().get("adminUid"),
+            shipment_id=shipment_id,
+            message=f"New direct clearing request from {importer_name or 'an importer'}.",
+            notif_type="direct_request",
+            tender_id=tender_ref.id,
+        )
+
     return {"id": tender_ref.id, **tender_data}
 
 
 @router.get("/tenders")
-def list_tenders(status: Optional[str] = None, user: dict = Depends(verify_token)):
-    """Clearing Agent Board -- lists tenders. Filter with ?status=open or ?status=closed."""
+def list_tenders(status: Optional[str] = None, mine: bool = False, user: dict = Depends(verify_token)):
+    """Clearing Agent Board -- lists tenders. Filter with ?status=open or
+    ?status=closed. ?mine=true returns the calling importer's own tenders
+    (open and closed, including direct requests) regardless of who they were
+    targeted at -- this is what powers "your requests" on FindAgent.
+
+    For everyone else (agents browsing), a tender that was sent as a direct
+    request to one agency is hidden from every other agency's view."""
     query = db.collection(TENDERS_COLLECTION)
     if status:
         query = query.where("status", "==", status)
 
-    return [{"id": doc.id, **doc.to_dict()} for doc in query.stream()]
+    tenders = [{"id": doc.id, **doc.to_dict()} for doc in query.stream()]
+
+    if mine:
+        return [t for t in tenders if t.get("importerId") == user["uid"]]
+
+    user_doc = db.collection(USERS_COLLECTION).document(user["uid"]).get()
+    profile = user_doc.to_dict() if user_doc.exists else {}
+    if profile.get("role") == "clearing_agent":
+        agency_id = profile.get("agencyId")
+        return [
+            t for t in tenders
+            if not t.get("targetAgencyId") or t.get("targetAgencyId") == agency_id
+        ]
+
+    return tenders
 
 
 @router.get("/tenders/{tender_id}")
@@ -125,12 +224,55 @@ def get_tender(tender_id: str, user: dict = Depends(verify_token)):
     return {"id": doc.id, **doc.to_dict()}
 
 
+@router.delete("/tenders/{tender_id}")
+def delete_tender(tender_id: str, user: dict = Depends(require_role("importer"))):
+    """SME withdraws one of their own requests. Only allowed while it's still
+    open -- once an agent is assigned there's nothing left to withdraw, and
+    there's deliberately no "update a posted request" endpoint: withdraw and
+    repost instead. Cascades to every bid on it (with a heads-up notification
+    to whoever had a pending bid in) and the underlying draft shipment, since
+    neither serves any purpose once the request is gone."""
+    tender_ref, tender_doc = _get_or_404(TENDERS_COLLECTION, tender_id, "Tender not found")
+    tender_data = tender_doc.to_dict()
+
+    if tender_data.get("importerId") != user["uid"]:
+        raise HTTPException(status_code=403, detail="Only the owning importer can withdraw this request")
+
+    if tender_data.get("status") != "open":
+        raise HTTPException(status_code=400, detail="Only an open request (not yet assigned) can be withdrawn")
+
+    for bid_doc in db.collection(BIDS_COLLECTION).where("tenderId", "==", tender_id).stream():
+        bid_data = bid_doc.to_dict()
+        if bid_data.get("status") == "pending":
+            create_notification(
+                user_id=bid_data.get("agentId"),
+                shipment_id=tender_data.get("shipmentId"),
+                message="An SME withdrew a request you had a bid on.",
+                notif_type="tender_withdrawn",
+            )
+        db.collection(BIDS_COLLECTION).document(bid_doc.id).delete()
+
+    tender_ref.delete()
+    db.collection(SHIPMENTS_COLLECTION).document(tender_data["shipmentId"]).delete()
+
+    return {"detail": "Request withdrawn"}
+
+
 # ---------- Bids ----------
 
 @router.get("/tenders/{tender_id}/bids")
 def list_bids(tender_id: str, user: dict = Depends(verify_token)):
     _get_or_404(TENDERS_COLLECTION, tender_id, "Tender not found")
     query = db.collection(BIDS_COLLECTION).where("tenderId", "==", tender_id)
+    return [{"id": doc.id, **doc.to_dict()} for doc in query.stream()]
+
+
+@router.get("/bids/mine")
+def list_my_bids(user: dict = Depends(verify_token)):
+    """Every bid the calling agent has placed, across all tenders -- powers
+    their "My Bids" list, which has no other way to enumerate its own bids
+    since GET /tenders/{id}/bids needs a tender id up front."""
+    query = db.collection(BIDS_COLLECTION).where("agentId", "==", user["uid"])
     return [{"id": doc.id, **doc.to_dict()} for doc in query.stream()]
 
 
@@ -166,6 +308,15 @@ def _check_agent_can_bid(user: dict):
     if user_data.get("isAgencyAdmin") and not agency_data.get("isIndependent", False):
         raise HTTPException(status_code=403, detail="Agency admins cannot place bids")
 
+    # A real agency's member agent needs a platform admin's sign-off too --
+    # a second, independent gate on top of their own agency admin's approval
+    # (agentStatus above). Independent agents skip this: their agentStatus
+    # IS the platform gate, approved directly by a platform admin.
+    if not agency_data.get("isIndependent", False) and user_data.get("platformStatus") != "approved":
+        raise HTTPException(status_code=403, detail="Agent is pending ImportEase platform review")
+
+    return user_data, agency_data
+
 
 @router.post("/tenders/{tender_id}/bids")
 def submit_bid(tender_id: str, bid: BidCreate, user: dict = Depends(verify_token)):
@@ -173,12 +324,17 @@ def submit_bid(tender_id: str, bid: BidCreate, user: dict = Depends(verify_token
     if tender_doc.to_dict().get("status") != "open":
         raise HTTPException(status_code=400, detail="This tender is no longer open")
 
-    _check_agent_can_bid(user)
+    agent_data, agency_data = _check_agent_can_bid(user)
 
     bid_ref = db.collection(BIDS_COLLECTION).document()
     bid_data = {
         "tenderId": tender_id,
         "agentId": user["uid"],
+        # Denormalized at submit time so the importer's bid review list can
+        # show who's bidding with zero extra lookups (there's no public
+        # "get agent info" endpoint, and bids can massively outnumber agents).
+        "agentName": agent_data.get("name"),
+        "agencyName": agency_data.get("companyName"),
         "feeLkr": bid.feeLkr,
         "clearanceTimelineHours": bid.clearanceTimelineHours,
         "notes": bid.notes,
@@ -187,6 +343,19 @@ def submit_bid(tender_id: str, bid: BidCreate, user: dict = Depends(verify_token
         "submittedAt": datetime.now(timezone.utc).isoformat(),
     }
     bid_ref.set(bid_data)
+
+    tender_data = tender_doc.to_dict()
+    create_notification(
+        user_id=tender_data.get("importerId"),
+        shipment_id=tender_data.get("shipmentId"),
+        message=(
+            f"New bid from "
+            f"{agent_data.get('name') or 'a clearing agent'} "
+            f"({agency_data.get('companyName') or 'agency'}) -- Rs. {bid.feeLkr:,.0f}"
+        ),
+        notif_type="new_bid",
+        tender_id=tender_id,
+    )
 
     return {"id": bid_ref.id, **bid_data}
 
@@ -271,14 +440,29 @@ def accept_bid(tender_id: str, bid_id: str, user: dict = Depends(verify_token)):
     bid_ref.update({"status": "accepted"})
     other_bids = db.collection(BIDS_COLLECTION).where("tenderId", "==", tender_id).stream()
     for other in other_bids:
-        if other.id != bid_id and other.to_dict().get("status") == "pending":
+        other_data = other.to_dict()
+        if other.id != bid_id and other_data.get("status") == "pending":
             db.collection(BIDS_COLLECTION).document(other.id).update({"status": "rejected"})
+            create_notification(
+                user_id=other_data.get("agentId"),
+                shipment_id=tender_data["shipmentId"],
+                message="Your bid was not selected for this shipment.",
+                notif_type="bid_rejected",
+                tender_id=tender_id,
+            )
 
     tender_ref.update({"status": "closed"})
 
     shipment_ref = db.collection(SHIPMENTS_COLLECTION).document(tender_data["shipmentId"])
     shipment_ref.update({
         "agentId": bid_data.get("agentId"),
+        # Denormalized from the winning bid so the SME's shipment tracker can
+        # show who's handling it, and the agreed price/timeline, with no
+        # extra lookup.
+        "agentName": bid_data.get("agentName"),
+        "agencyName": bid_data.get("agencyName"),
+        "feeLkr": bid_data.get("feeLkr"),
+        "clearanceTimelineHours": bid_data.get("clearanceTimelineHours"),
         "currentStage": "assigned",
     })
 
@@ -286,6 +470,54 @@ def accept_bid(tender_id: str, bid_id: str, user: dict = Depends(verify_token)):
         user_id=bid_data.get("agentId"),
         shipment_id=tender_data["shipmentId"],
         message=f"Your bid was accepted! You're now assigned to shipment {tender_data['shipmentId']}.",
+        notif_type="bid_accepted",
+        tender_id=tender_id,
+    )
+
+    return {"id": bid_id, **bid_ref.get().to_dict()}
+
+
+@router.post("/tenders/{tender_id}/bids/{bid_id}/reject")
+def reject_bid(tender_id: str, bid_id: str, user: dict = Depends(verify_token)):
+    """Importer rejects a bid on a direct request (one sent to one specific
+    agency, not the open marketplace board). On the open board there's
+    nothing to reject standalone -- accepting a different bid already
+    rejects the rest -- so this only applies where targetAgencyId is set,
+    since a direct request only ever gets the one bid from that agency.
+    Rejecting closes the tender (there's no other bidder coming), which also
+    frees the SME from the duplicate-open-request guard so they can post a
+    fresh request -- open board or to a different agent -- right away."""
+    tender_ref, tender_doc = _get_or_404(TENDERS_COLLECTION, tender_id, "Tender not found")
+    tender_data = tender_doc.to_dict()
+
+    if tender_data.get("importerId") != user["uid"]:
+        raise HTTPException(status_code=403, detail="Only the owning importer can reject a bid")
+
+    if not tender_data.get("targetAgencyId"):
+        raise HTTPException(
+            status_code=400,
+            detail="Bids on the open marketplace board can't be rejected directly -- "
+                   "accept a different bid to reject the rest.",
+        )
+
+    if tender_data.get("status") != "open":
+        raise HTTPException(status_code=400, detail="This tender is already closed")
+
+    bid_ref, bid_doc = _get_bid_or_404(tender_id, bid_id)
+    bid_data = bid_doc.to_dict()
+
+    if bid_data.get("status") != "pending":
+        raise HTTPException(status_code=400, detail="This bid is no longer pending")
+
+    bid_ref.update({"status": "rejected"})
+    tender_ref.update({"status": "closed"})
+
+    create_notification(
+        user_id=bid_data.get("agentId"),
+        shipment_id=tender_data.get("shipmentId"),
+        message="Your bid was not selected for this shipment.",
+        notif_type="bid_rejected",
+        tender_id=tender_id,
     )
 
     return {"id": bid_id, **bid_ref.get().to_dict()}

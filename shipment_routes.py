@@ -39,9 +39,18 @@ STAGE_ORDER = [
 class ShipmentCreate(BaseModel):
     origin: str
     destination: str
-    hsCode: str
+    # Optional -- an SME can post a clearing request with just the details
+    # below even without having picked an HS code from the calculator first.
+    hsCode: Optional[str] = None
     declaredValue: float
     description: str
+    # Contact + timing details collected on the "Find a clearing agent" request
+    # form. All optional so existing callers (and any future ones that don't
+    # need them) keep working unchanged.
+    estimatedArrival: Optional[str] = None  # ISO date -- when the cargo is expected to arrive
+    mustReleaseBy: Optional[str] = None  # ISO date -- latest acceptable release date
+    contactPhone: Optional[str] = None
+    contactEmail: Optional[str] = None
 
 
 class ShipmentUpdate(BaseModel):
@@ -49,6 +58,10 @@ class ShipmentUpdate(BaseModel):
     destination: Optional[str] = None
     declaredValue: Optional[float] = None
     description: Optional[str] = None
+    estimatedArrival: Optional[str] = None
+    mustReleaseBy: Optional[str] = None
+    contactPhone: Optional[str] = None
+    contactEmail: Optional[str] = None
 
 
 class StatusUpdate(BaseModel):
@@ -79,7 +92,14 @@ def create_shipment(shipment: ShipmentCreate, user: dict = Depends(require_role(
         "hsCode": shipment.hsCode,
         "declaredValue": shipment.declaredValue,
         "description": shipment.description,
+        "estimatedArrival": shipment.estimatedArrival,
+        "mustReleaseBy": shipment.mustReleaseBy,
+        "contactPhone": shipment.contactPhone,
+        "contactEmail": shipment.contactEmail,
         "importerId": user["uid"],
+        # Denormalized so the assigned agent's Shipments page can show who
+        # they're working for without a per-card importer lookup.
+        "importerName": user["profile"].get("name"),
         "agentId": None,
         "currentStage": STAGE_ORDER[0],
         "reference": f"IE-{doc_ref.id[:8].upper()}",
@@ -204,6 +224,7 @@ def update_shipment_status(shipment_id: str, status_update: StatusUpdate,
         user_id=data.get("importerId"),
         shipment_id=shipment_id,
         message=f"Your shipment {data.get('reference', shipment_id)} has moved to '{expected_next}'.",
+        notif_type="stage_update",
     )
 
     return {"currentStage": expected_next}
