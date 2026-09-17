@@ -31,6 +31,22 @@ class RegisterRequest(BaseModel):
     address: Optional[str] = None
 
 
+class GoogleProfileRequest(BaseModel):
+    """Body for POST /auth/register-profile -- creates the Firestore profile
+    for a caller who is ALREADY authenticated (signed in with Google via
+    Firebase, so a Firebase Auth user already exists). Mirrors RegisterRequest
+    minus name/email/password, which come from the verified ID token instead."""
+    role: str  # "importer" or "clearing_agent"
+    agencyCode: Optional[str] = None
+
+    phone: Optional[str] = None
+    licenseNumber: Optional[str] = None
+    licenseExpiry: Optional[str] = None
+    experience: Optional[str] = None
+    agentId: Optional[str] = None
+    address: Optional[str] = None
+
+
 class ProfileUpdateRequest(BaseModel):
     phone: Optional[str] = None
     # Importer-specific fields
@@ -174,6 +190,95 @@ def register(data: RegisterRequest):
             "id": user_record.uid,
             **user_data
         }
+    }
+
+
+@router.post("/auth/register-profile")
+def register_profile(data: GoogleProfileRequest, user: dict = Depends(verify_token)):
+    """Creates the Firestore profile for a caller who signed in with Google
+    (or any Firebase provider) and already has a Firebase Auth user, but no
+    `users/{uid}` document yet -- the Google equivalent of /auth/register,
+    which instead creates the Firebase Auth user itself from a password."""
+    from datetime import datetime, timezone
+
+    uid = user["uid"]
+
+    if db.collection("users").document(uid).get().exists:
+        raise HTTPException(status_code=400, detail="Profile already exists")
+
+    if data.role not in ["importer", "clearing_agent"]:
+        raise HTTPException(status_code=400, detail="Invalid role")
+
+    name = user.get("name") or user.get("email", "").split("@")[0]
+    email = user.get("email")
+
+    agency_id = None
+    is_agency_admin = False
+
+    if data.role == "clearing_agent":
+        if data.agencyCode:
+            agency_id, agency_data = find_agency_by_code(data.agencyCode)
+            if not agency_id:
+                raise HTTPException(status_code=400, detail="Invalid agency code")
+            is_agency_admin = False
+        else:
+            agency_id = None
+            is_agency_admin = True
+
+    if data.role == "clearing_agent" and is_agency_admin:
+        agency_code = generate_agency_code()
+        while find_agency_by_code(agency_code)[0] is not None:
+            agency_code = generate_agency_code()
+
+        agency_data = {
+            "companyName": name,
+            "email": email,
+            "agencyCode": agency_code,
+            "adminUid": uid,
+            "profileStatus": "incomplete",
+            "businessRegNumber": None,
+            "licenseNumber": None,
+            "businessAddress": None,
+            "businessPhone": None,
+            "isIndependent": True,
+            "createdAt": datetime.now(timezone.utc).isoformat()
+        }
+        agency_ref = db.collection("agencies").document()
+        agency_ref.set(agency_data)
+        agency_id = agency_ref.id
+
+    user_data = {
+        "name": name,
+        "email": email,
+        "role": data.role,
+        "createdAt": datetime.now(timezone.utc).isoformat(),
+    }
+
+    if data.role == "importer":
+        user_data["profileComplete"] = False
+
+    if data.role == "clearing_agent":
+        user_data["agencyId"] = agency_id
+        user_data["isAgencyAdmin"] = is_agency_admin
+        user_data["isIndependent"] = is_agency_admin
+        user_data["agentStatus"] = "pending"
+        user_data["profileComplete"] = bool(data.phone)
+        user_data["phone"] = data.phone
+
+        if is_agency_admin:
+            user_data["licenseNumber"] = data.licenseNumber
+            user_data["licenseExpiry"] = data.licenseExpiry
+            user_data["experience"] = data.experience
+            user_data["agentId"] = data.agentId
+            user_data["address"] = data.address
+        else:
+            user_data["platformStatus"] = "pending"
+
+    db.collection("users").document(uid).set(user_data)
+
+    return {
+        "id": uid,
+        **user_data
     }
 
 

@@ -6,16 +6,17 @@ from fastapi.middleware.cors import CORSMiddleware
 
 import firebase_setup  # noqa: F401  (import triggers Firebase initialization)
 
-from auth_routes import router as auth_router
-from agency_routes import router as agency_router
-from hscode_routes import router as hscode_router
-from shipment_routes import router as shipment_router
-from tender_routes import router as tender_router 
-from document_routes import router as document_router
-from notification_routes import router as notification_router
-from agent_rating_routes import router as agent_rating_router
-from admin_routes import router as admin_router
-from agent_verification_routes import router as agent_verification_router
+from routes.auth_routes import router as auth_router
+from routes.agency_routes import router as agency_router
+from routes.hscode_routes import router as hscode_router
+from routes.shipment_routes import router as shipment_router
+from routes.tender_routes import router as tender_router
+from routes.document_routes import router as document_router
+from routes.notification_routes import router as notification_router
+from routes.agent_rating_routes import router as agent_rating_router
+from routes.admin_routes import router as admin_router
+from routes.agent_verification_routes import router as agent_verification_router
+from routes.message_routes import router as message_router
 
 load_dotenv()
 
@@ -49,6 +50,7 @@ app.include_router(notification_router)
 app.include_router(agent_rating_router)
 app.include_router(admin_router)
 app.include_router(agent_verification_router)
+app.include_router(message_router)
 
 
 @app.get("/")

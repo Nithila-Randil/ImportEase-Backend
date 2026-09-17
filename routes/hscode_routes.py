@@ -8,7 +8,7 @@ import os
 from pinecone import Pinecone
 
 from firebase_setup import db
-from duty_calculator import calculate_landed_cost, list_preferential_countries
+from services.duty_calculator import calculate_landed_cost, list_preferential_countries
 
 router = APIRouter()
 

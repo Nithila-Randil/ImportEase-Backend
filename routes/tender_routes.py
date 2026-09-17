@@ -27,7 +27,7 @@ from pydantic import BaseModel
 
 from firebase_setup import db
 from dependencies import verify_token, require_role
-from notification_routes import create_notification
+from routes.notification_routes import create_notification
 
 router = APIRouter()
 
