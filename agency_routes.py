@@ -21,6 +21,13 @@ class AgencyRegisterRequest(BaseModel):
     password: str
 
 
+class GoogleAgencyRegisterRequest(BaseModel):
+    """Body for POST /agencies/register-profile -- creates a new agency for a
+    caller who is ALREADY authenticated (signed in with Google), so no
+    password/Firebase-user creation is needed."""
+    companyName: str
+
+
 class AgencyProfileRequest(BaseModel):
     licenseNumber: str
     businessAddress: str
@@ -96,6 +103,63 @@ def register_agency(data: AgencyRegisterRequest):
         },
         "user": {
             "id": user_record.uid,
+            **user_data
+        }
+    }
+
+
+@router.post("/agencies/register-profile")
+def register_agency_profile(data: GoogleAgencyRegisterRequest, user: dict = Depends(verify_token)):
+    """The Google equivalent of /agencies/register: attaches a brand-new
+    agency to the ALREADY authenticated caller instead of creating a new
+    Firebase Auth user from an email/password."""
+    uid = user["uid"]
+    email = user.get("email")
+
+    if db.collection("users").document(uid).get().exists:
+        raise HTTPException(status_code=400, detail="Profile already exists")
+
+    agency_code = generate_agency_code()
+    while find_agency_by_code(agency_code)[0] is not None:
+        agency_code = generate_agency_code()
+
+    agency_data = {
+        "companyName": data.companyName,
+        "email": email,
+        "agencyCode": agency_code,
+        "adminUid": uid,
+        "profileStatus": "incomplete",
+        "businessRegNumber": None,
+        "licenseNumber": None,
+        "businessAddress": None,
+        "businessPhone": None,
+        "isIndependent": False,
+        "createdAt": datetime.now(timezone.utc).isoformat()
+    }
+    agency_ref = db.collection("agencies").document()
+    agency_ref.set(agency_data)
+    agency_id = agency_ref.id
+
+    user_data = {
+        "name": data.companyName,
+        "email": email,
+        "role": "clearing_agent",
+        "agencyId": agency_id,
+        "isAgencyAdmin": True,
+        "isIndependent": False,
+        "agentStatus": "pending",
+        "profileComplete": False,
+        "phone": None
+    }
+    db.collection("users").document(uid).set(user_data)
+
+    return {
+        "agency": {
+            "id": agency_id,
+            **agency_data
+        },
+        "user": {
+            "id": uid,
             **user_data
         }
     }
